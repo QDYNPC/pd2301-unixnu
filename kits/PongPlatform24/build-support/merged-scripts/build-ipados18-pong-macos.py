@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Build Pong Darwin 24 from this branch's scripts and pinned source feeds."""
-import argparse, datetime, json, os, shutil, subprocess, sys, tomllib
+import argparse, datetime, json, os, shutil, subprocess, sys
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 from pathlib import Path
 DEVICE=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(DEVICE/'scripts'))

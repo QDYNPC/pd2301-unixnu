@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Mac: pack zizhan SILICIUM_UEFI.fd + DTB into an Android boot image v4 (fastboot boot only)."""
 import os
-import gzip, hashlib, subprocess, sys, tempfile, tomllib
+import gzip, hashlib, subprocess, sys, tempfile
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 from pathlib import Path
 SRC = Path(os.environ.get('ZIZHAN_SRC', Path.home() / 'zizhan'))
 U = SRC / 'uefi-zizhan'
