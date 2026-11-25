@@ -31,10 +31,23 @@ def main():
     a=p.parse_args();tree=a.tree.resolve()
     tree.mkdir(parents=True,exist_ok=True)
     refs=[r for r in tomllib.loads((DEVICE/'feeds.toml').read_text())['source'] if r['kind']=='refer']
+    import hashlib
+    feeds_root=Path(os.environ.get('UNIXNU_FEEDS','/root/unixnu/out/feeds'))
     for ref in refs:
         src=DEVICE/'refer/ipados18'/ref['ref']
-        rev=subprocess.check_output(['git','rev-parse','HEAD'],cwd=src,text=True).strip()
-        if rev!=ref['commit']:raise RuntimeError(f'Wrong source revision for {ref["name"]}')
+        if not (src/'.git').is_dir() and not (src/'.unixnu-commit').is_file():
+            # unixnu feeds fallback: tarball checkout named <repo>-<sha1[:8]>
+            key=hashlib.sha1(f"{ref['git']}\n{ref['commit']}".encode()).hexdigest()[:8]
+            alt=feeds_root/(Path(ref['git']).stem+'-'+key)
+            if alt.is_dir():src=alt
+        marker=src/'.unixnu-commit'
+        if marker.is_file():
+            rev=marker.read_text().strip()
+        elif (src/'.git').is_dir():
+            rev=subprocess.check_output(['git','rev-parse','HEAD'],cwd=src,text=True).strip()
+        else:
+            raise RuntimeError(f'missing source for {ref["name"]}: {src}')
+        if rev!=ref['commit']:raise RuntimeError(f'Wrong source revision for {ref["name"]} ({rev[:12]} != {ref["commit"][:12]})')
         link(src,tree/'refer'/ref['name'])
     for name in ('drivers','kits','package'):link(DEVICE/name,tree/name)
     (tree/'scripts').mkdir(exist_ok=True)
