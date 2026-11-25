@@ -57,7 +57,7 @@ AVAILABILITY_TAG=${UNIXNU_AVAILABILITYVERSIONS_TAG:-AvailabilityVersions-143.7}
 if [ ! -d refer/xnu/.git ]; then
   git clone --depth 1 --branch "$XNU_TAG" https://github.com/apple-oss-distributions/xnu.git refer/xnu
 fi
-if [ "$(git -C refer/xnu rev-parse HEAD)" != "$XNU_COMMIT" ]; then
+if [ "${UNIXNU_SKIP_XNU_REV_CHECK:-0}" != 1 ] && [ "$(git -C refer/xnu rev-parse HEAD)" != "$XNU_COMMIT" ]; then
   echo 'error: unexpected XNU reference revision' >&2
   exit 1
 fi
