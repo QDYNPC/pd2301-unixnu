@@ -1,7 +1,10 @@
 """Host inputs for Pong builders; local paths never belong in public recipes."""
 import os
 from pathlib import Path
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 import pong_paths
 
 ROOT = Path(__file__).resolve().parents[1]
