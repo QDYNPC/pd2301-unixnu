@@ -65,9 +65,16 @@ fi
 if [ ! -d .cache/xnu-work/.git ]; then
   git clone --shared refer/xnu .cache/xnu-work
 fi
-if [ "$(git -C .cache/xnu-work rev-parse HEAD)" != "$XNU_COMMIT" ]; then
-  echo 'error: existing XNU work tree is another version; use a fresh output directory' >&2
+WORK_REV=$(cat .cache/xnu-work/.unixnu-commit 2>/dev/null || git -C .cache/xnu-work rev-parse HEAD)
+if [ "${UNIXNU_SKIP_XNU_REV_CHECK:-0}" != 1 ] && [ "$WORK_REV" != "$XNU_COMMIT" ]; then
+  echo "error: existing XNU work tree is another version ($WORK_REV); use a fresh output directory" >&2
   exit 1
+fi
+# Reset the work tree to its clone baseline so the patch series applies idempotently.
+if [ -d .cache/xnu-work/.git ]; then
+  echo "Resetting xnu-work to its baseline"
+  git -C .cache/xnu-work reset -q --hard HEAD
+  git -C .cache/xnu-work clean -qfd
 fi
 if [ ! -x .cache/fakeroot/usr/local/libexec/availability.pl ]; then
   if [ ! -d refer/AvailabilityVersions/.git ]; then

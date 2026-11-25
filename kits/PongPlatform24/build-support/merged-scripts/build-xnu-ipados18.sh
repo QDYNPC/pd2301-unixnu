@@ -5,7 +5,7 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 cd "$ROOT"
 # Refuse Wi-Fi and backlight before any XNU compile when their trees are absent.
 # The later builders still refuse on their own; this only moves that refusal forward.
-if [ "${XNU_PONG_WIFI:-0}" = 1 ] || [ "${XNU_PONG_BACKLIGHT:-0}" = 1 ]; then
+if [ "${XNU_PONG_WIFI:-0}" = 1 ] || [ "${XNU_PONG_BACKLIGHT:-0}" = 1 ] || [ "${XNU_PONG_POWER:-0}" = 1 ]; then
   if [ -z "${PONG_NATIVE_DRIVER_SOURCE:-}" ]; then
     echo 'refusing before compile: PONG_NATIVE_DRIVER_SOURCE is unset, so Wi-Fi and backlight inputs cannot be resolved' >&2
     exit 1
@@ -65,50 +65,16 @@ fi
 if [ ! -d .cache/xnu-work/.git ]; then
   git clone --shared refer/xnu .cache/xnu-work
 fi
-if [ "$(git -C .cache/xnu-work rev-parse HEAD)" != "$XNU_COMMIT" ]; then
-  echo 'error: existing XNU work tree is another version; use a fresh output directory' >&2
+WORK_REV=$(cat .cache/xnu-work/.unixnu-commit 2>/dev/null || git -C .cache/xnu-work rev-parse HEAD)
+if [ "${UNIXNU_SKIP_XNU_REV_CHECK:-0}" != 1 ] && [ "$WORK_REV" != "$XNU_COMMIT" ]; then
+  echo "error: existing XNU work tree is another version ($WORK_REV); use a fresh output directory" >&2
   exit 1
 fi
-
-# Compute deterministic fingerprint of current XNU patches to detect changes and avoid double/stale application.
-CURRENT_PATCHES_HASH=$(python3 - <<'PY_PATCH_HASH'
-import hashlib, os
-from pathlib import Path
-h = hashlib.sha256()
-h.update(os.environ.get('XNU_COMMIT', '').encode('utf-8'))
-patch_dir = Path('patches/xnu') if Path('patches/xnu').is_dir() else Path('patches/xnu-ipados18')
-for p in sorted(p for p in patch_dir.glob('*.patch') if p.is_file()):
-    h.update(b'\0')
-    h.update(p.name.encode('utf-8'))
-    h.update(b':')
-    h.update(p.read_bytes())
-print(h.hexdigest())
-PY_PATCH_HASH
-)
-
-PATCH_STAMP=".cache/xnu-applied-patches.sha256"
-RESET_XNU_WORK=0
-
-if [ ! -f "$PATCH_STAMP" ]; then
-  echo "No applied patch record found ($PATCH_STAMP); preparing clean work tree."
-  RESET_XNU_WORK=1
-else
-  PREV_HASH="$(cat "$PATCH_STAMP" 2>/dev/null || true)"
-  if [ "$PREV_HASH" != "$CURRENT_PATCHES_HASH" ]; then
-    echo "Patch set changed (prev: ${PREV_HASH:0:12}, current: ${CURRENT_PATCHES_HASH:0:12}). Resetting work tree..."
-    RESET_XNU_WORK=1
-  else
-    echo "Patch set unchanged (${CURRENT_PATCHES_HASH:0:12}). Preserving cached work tree."
-  fi
-fi
-
-if [ "$RESET_XNU_WORK" = "1" ]; then
-  echo "Resetting .cache/xnu-work to clean upstream $XNU_COMMIT..."
-  git -C .cache/xnu-work reset --hard "$XNU_COMMIT"
-  git -C .cache/xnu-work clean -fd
-  rm -f "$ROOT/.cache/fakeroot/.xnu-$XNU_VERSION-headers" 2>/dev/null || true
-  rm -f .cache/xnu-patch-times.json 2>/dev/null || true
-  rm -rf "$ROOT/build/xnu" 2>/dev/null || true
+# Reset the work tree to its clone baseline so the patch series applies idempotently.
+if [ -d .cache/xnu-work/.git ]; then
+  echo "Resetting xnu-work to its baseline"
+  git -C .cache/xnu-work reset -q --hard HEAD
+  git -C .cache/xnu-work clean -qfd
 fi
 if [ ! -x .cache/fakeroot/usr/local/libexec/availability.pl ]; then
   if [ ! -d refer/AvailabilityVersions/.git ]; then
@@ -128,8 +94,7 @@ from pathlib import Path
 import hashlib, json
 work = Path('.cache/xnu-work')
 snapshot = {}
-patch_dir = Path('patches/xnu') if Path('patches/xnu').is_dir() else Path('patches/xnu-ipados18')
-for patch in sorted(patch_dir.glob('*.patch')):
+for patch in Path('patches/xnu').glob('*.patch'):
     for line in patch.read_text().splitlines():
         if line.startswith('+++ b/'):
             relative = line[6:].split('\t', 1)[0]
@@ -146,21 +111,18 @@ while IFS= read -r LATE_PATCH; do
   fi
 done < <(python3 - <<'PY_LATE_PATCHES'
 from pathlib import Path
-patch_dir = Path('patches/xnu') if Path('patches/xnu').is_dir() else Path('patches/xnu-ipados18')
-patches = [p.resolve() for p in patch_dir.glob('zz*pong*.patch')]
-for name in ('zzz-boot-progress.patch', 'zzy-native-gpu-addon-mount.patch'):
-    candidate = patch_dir / name
-    if candidate.is_file():
-        patches.append(candidate.resolve())
+patches = [p.resolve() for p in Path('patches/xnu').glob('zz*pong*.patch')]
+# zizhan: 0002+ stack on 0001: 0008 edits PONG.h and board_config.h, which 0001 creates or changes, so the reverse check of
+# 0001 fails while they are applied, and the fallback below then undid 0001. Take them off too; the loop re-applies them
+# and the mtime snapshot keeps unchanged files from rebuilding. No parentheses or quotes here: bash 3.2 parses this heredoc.
+patches += [p.resolve() for p in Path('patches/xnu').glob('[0-9][0-9][0-9][0-9]-*.patch') if not p.name.startswith('0001-')]
+patches += [Path('patches/xnu/zzz-boot-progress.patch').resolve(),
+            Path('patches/xnu/zzy-native-gpu-addon-mount.patch').resolve()]
 for patch in sorted(set(patches), reverse=True):
     print(patch)
 PY_LATE_PATCHES
 )
-if [ -d "$ROOT/patches/xnu" ]; then
-  PATCHES=("$ROOT"/patches/xnu/*.patch)
-else
-  PATCHES=("$ROOT"/patches/xnu-ipados18/*.patch)
-fi
+PATCHES=("$ROOT"/patches/xnu/*.patch)
 if [ "$XNU_VERSION" = "10063.141.1" ]; then
   PATCHES+=("$ROOT"/kits/NativePrelink/patches/*.patch)
 fi
@@ -208,8 +170,9 @@ for PATCH in "${PATCHES[@]}"; do
     echo "Already applied: $(basename "$PATCH")"
   elif git -C .cache/xnu-work apply --check "$PATCH" >/dev/null 2>&1; then
     git -C .cache/xnu-work apply "$PATCH"
-  elif patch --dry-run --batch --fuzz=3 -p1 -d .cache/xnu-work < "$PATCH" >/dev/null 2>&1; then
-    patch --batch --fuzz=3 -p1 -d .cache/xnu-work < "$PATCH"
+  elif patch --dry-run --forward --batch --fuzz=3 -p1 -d .cache/xnu-work < "$PATCH" >/dev/null 2>&1; then
+    # --forward: plain --batch takes hunks that look applied as reversed and undoes them (g100 lost 0001 that way)
+    patch --forward --batch --fuzz=3 -p1 -d .cache/xnu-work < "$PATCH"
   else
     echo "Patch does not apply cleanly to XNU $XNU_VERSION: $PATCH" >&2
     exit 1
@@ -224,7 +187,12 @@ for relative, (digest, atime, mtime) in json.loads(Path('.cache/xnu-patch-times.
     if path.is_file() and hashlib.sha256(path.read_bytes()).hexdigest() == digest:
         os.utime(path, ns=(atime, mtime))
 PY_PATCH_TIMES
-printf '%s\n' "$CURRENT_PATCHES_HASH" > "$PATCH_STAMP"
+# zizhan POWER-02: the framebuffer accounting patch shares its actual owner
+# state machine with the host replay. Keep this controlled header in the local
+# generated XNU tree; reference sources are never modified.
+if ! cmp -s "$ROOT/drivers/PongPower/ZizhanDisplayOwner.h" .cache/xnu-work/iokit/Kernel/ZizhanDisplayOwner.h; then
+  cp "$ROOT/drivers/PongPower/ZizhanDisplayOwner.h" .cache/xnu-work/iokit/Kernel/ZizhanDisplayOwner.h
+fi
 export XNU_AVAILABILITY_PL=$ROOT/.cache/fakeroot/usr/local/libexec/availability.pl
 python3 scripts/prepare-xnu-source.py
 BOOT_PROGRESS=${XNU_BOOT_PROGRESS:-0}
@@ -310,27 +278,20 @@ if [ "${XNU_NATIVE_UFS:-0}" = 1 ] && [ -n "${PONG_NATIVE_DRIVER_SOURCE:-}" ]; th
 fi
 if [ "${XNU_PONG_WIFI:-0}" = 1 ]; then
   # The Wi-Fi stack needs inputs that are not part of any public restore.
-  # Flags/environment/local.toml resolve in pong_native_inputs. Keep the
-  # archive in this same tree; never link a previous branch's wireless stack.
+  # Point PONG_WIFI_SOURCE/PONG_WIFI_BUILD/PONG_WIFI_FIRMWARE (or the flags
+  # below) at them; refuse rather than silently building without a backend.
+  WIFI_INPUTS=${PONG_INPUTS:?PONG_INPUTS is required for Wi-Fi inputs}
+  WIFI_SOURCE=${PONG_WIFI_SOURCE:-$WIFI_INPUTS/wifi-source-7.0.14}
+  WIFI_BUILD=${PONG_WIFI_BUILD:-$WIFI_INPUTS/wifi-ath11k-build}
+  WIFI_FIRMWARE=${PONG_WIFI_FIRMWARE:-$WIFI_INPUTS/pong-wifi-firmware}
   python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-ath11k.py" \
-    --output-dir "$ROOT/build/pong-ath11k" --jobs "${JOBS:-4}"
-  python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-wifi-native.py" --tree "$ROOT"
+    --linux "$WIFI_SOURCE" \
+    --output-dir "$WIFI_BUILD"
+  python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-wifi-native.py" --tree "$ROOT" \
+    --ath11k "$WIFI_BUILD/libPongAth11k.a" --firmware "$WIFI_FIRMWARE"
 fi
-if [ "${XNU_T970_ATH11K_LINK:-0}" = 1 ]; then
-  # SM-T970 (QCA6390), first step of the Wi-Fi integration: the Linux ath11k / MHI / QMI stack and the shared
-  # station are compiled and linked into this kernel and nothing calls them yet (no board file starts nw_wifi_start).
-  # The two source trees stay outside the build output (the CI's artifact step copies every */kernel/* path under it).
-  T970_WIFI_INPUTS=${T970_WIFI_INPUTS:-${RUNNER_TEMP:-${TMPDIR:-/tmp}}/pong-native-inputs}
-  export PONG_WIFI_SOURCE=${PONG_WIFI_SOURCE:-$T970_WIFI_INPUTS/linux-7.0.14}
-  export PONG_WIFI_SHARED=${PONG_WIFI_SHARED:-$T970_WIFI_INPUTS/Ath12kWifi}
-  python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/fetch-pong-native-sources.py" --only wifi_linux --only wifi_shared
-  python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-t970-ath11k-link.py" --output-dir "$ROOT/build/t970-ath11k" --jobs "${JOBS:-4}" --tree "$ROOT"
-fi
-if [ "${XNU_PONG_POWER:-0}" = 1 ]; then
+if [ "${XNU_PONG_WIFI:-0}" = 1 ] || [ "${XNU_PONG_BACKLIGHT:-0}" = 1 ] || [ "${XNU_PONG_POWER:-0}" = 1 ]; then
   python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-power-native.py" --tree "$ROOT"
-fi
-if [ "${XNU_PONG_POWER:-0}" = 1 ] || [ "${XNU_PONG_ADRENO_PLATFORM:-0}" = 1 ] || [ "${XNU_PONG_WIFI:-0}" = 1 ]; then
-  python3 "$PONG_NATIVE_DRIVER_SOURCE/scripts/build-pong-smmu4k.py" --tree "$ROOT"
 fi
 if [ ! -f "$KERNEL_SDKROOT/usr/local/lib/kernel/libfirehose_kernel.a" ]; then
   bash scripts/build-firehose.sh
@@ -1062,29 +1023,17 @@ PY_RAM_BLOCK_BINDINGS
     PLATFORM_ARCHIVES="$PLATFORM_ARCHIVES -Wl,-force_load,$ROOT/build/pong-adreno/libPongAdrenoPlatform.a"
     PLATFORM_DEPENDENCIES="$PLATFORM_DEPENDENCIES $ROOT/build/pong-adreno/libPongAdrenoPlatform.a"
   fi
-  if [ "${XNU_PONG_POWER:-0}" = 1 ]; then
+  if [ "${XNU_PONG_WIFI:-0}" = 1 ] || [ "${XNU_PONG_BACKLIGHT:-0}" = 1 ] || [ "${XNU_PONG_POWER:-0}" = 1 ]; then
     POWER_ARCHIVE=$ROOT/build/pong-power/libPongPower.a
     test -f "$POWER_ARCHIVE"
     PLATFORM_ARCHIVES="$PLATFORM_ARCHIVES -Wl,-force_load,$POWER_ARCHIVE"
     PLATFORM_DEPENDENCIES="$PLATFORM_DEPENDENCIES $POWER_ARCHIVE"
-  fi
-  if [ "${XNU_PONG_POWER:-0}" = 1 ] || [ "$PONG_ADRENO_PLATFORM" = 1 ] || [ "${XNU_PONG_WIFI:-0}" = 1 ]; then
-    SMMU4K_ARCHIVE=$ROOT/build/pong-smmu4k/libPongSmmu4K.a
-    test -f "$SMMU4K_ARCHIVE"
-    PLATFORM_ARCHIVES="$PLATFORM_ARCHIVES -Wl,-force_load,$SMMU4K_ARCHIVE"
-    PLATFORM_DEPENDENCIES="$PLATFORM_DEPENDENCIES $SMMU4K_ARCHIVE"
   fi
   if [ "${XNU_PONG_WIFI:-0}" = 1 ]; then
     WIFI_ARCHIVE=$ROOT/build/pong-wifi/libPongWifiNative.a
     test -f "$WIFI_ARCHIVE"
     PLATFORM_ARCHIVES="$PLATFORM_ARCHIVES -Wl,-force_load,$WIFI_ARCHIVE"
     PLATFORM_DEPENDENCIES="$PLATFORM_DEPENDENCIES $WIFI_ARCHIVE"
-  fi
-  if [ "${XNU_T970_ATH11K_LINK:-0}" = 1 ]; then
-    T970_ATH11K_ARCHIVE=$ROOT/build/t970-ath11k/libT970Ath11k.a
-    test -f "$T970_ATH11K_ARCHIVE"
-    PLATFORM_ARCHIVES="$PLATFORM_ARCHIVES -Wl,-force_load,$T970_ATH11K_ARCHIVE"
-    PLATFORM_DEPENDENCIES="$PLATFORM_DEPENDENCIES $T970_ATH11K_ARCHIVE"
   fi
   EXTRA_MAKE_ARGS+=("LD_KERNEL_ARCHIVES=$PLATFORM_ARCHIVES")
   EXTRA_MAKE_ARGS+=("XNU_EXTERNAL_KERNEL_ARCHIVES=$PLATFORM_DEPENDENCIES")
@@ -1172,13 +1121,6 @@ for argument in sys.argv[1:]:
             raise SystemExit('Conflicting per-object flag assignments: ' + key)
         seen.add(key)
 PY_OBJECT_FLAGS
-if command -v ccache >/dev/null 2>&1; then
-  CCACHE_BIN="$(command -v ccache)"
-  echo "ccache detected: $CCACHE_BIN"
-  echo "=== ccache statistics (before compilation) ==="
-  "$CCACHE_BIN" -s -v || true
-  EXTRA_MAKE_ARGS+=("CCACHE=$CCACHE_BIN")
-fi
 make -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iphoneos}" ARCH_CONFIGS=ARM64 \
   MACHINE_CONFIGS=PONG KERNEL_CONFIGS=DEVELOPMENT \
   ARCH_STRING_FOR_CURRENT_MACHINE_CONFIG=arm64 LARGE_MEMORY_DEFINE=-UARM_LARGE_MEMORY \
@@ -1186,14 +1128,9 @@ make -C .cache/xnu-work "${XNU_BUILD_TARGET:-build}" SDKROOT="${XNU_SDKROOT:-iph
   DEPLOYMENT_TARGET_FLAGS="-miphoneos-version-min=${UNIXNU_IOS_TARGET:-18.0} -DXNU_TARGET_OS_IOS" \
   DEPLOYMENT_LINKER_FLAGS="-Wl,-ios_version_min,${UNIXNU_IOS_TARGET:-18.0}" \
   RC_DARWIN_KERNEL_VERSION="$XNU_DARWIN" RC_ProjectSourceVersion="$XNU_VERSION" \
-  BUILD_LTO=0 BUILD_STATIC_LINK=0 BUILD_DSYM="${XNU_BUILD_DSYM:-0}" BUILD_COMPILE_COMMANDS=0 BOUND_CHECKS=0 BUILD_WERROR="${XNU_BUILD_WERROR:-0}" MAKEJOBS=-j"${JOBS:-4}" \
+  BUILD_LTO=0 BUILD_STATIC_LINK=0 BUILD_DSYM="${XNU_BUILD_DSYM:-0}" BOUND_CHECKS=0 BUILD_WERROR="${XNU_BUILD_WERROR:-0}" MAKEJOBS=-j"${JOBS:-4}" \
   RC_NONARCH_CFLAGS="$EXTRA_CFLAGS" "${EXTRA_MAKE_ARGS[@]}" \
   OBJROOT="$ROOT/build/xnu/ios-obj" SYMROOT="$ROOT/build/xnu/ios-sym" DSTROOT="$ROOT/build/xnu/ios-dst"
-if command -v ccache >/dev/null 2>&1; then
-  echo "=== ccache statistics (after compilation) ==="
-  "$CCACHE_BIN" -s -v || true
-  "$CCACHE_BIN" --print-stats || true
-fi
 if [ "${XNU_SOURCE_CORECRYPTO14:-0}" = 1 ] && [ "$CRYPTO_BOOTSTRAP_MODE" = source ]; then
   python3 scripts/seal-source-crypto-kernel.py \
     build/xnu/ios-obj/DEVELOPMENT_ARM64_PONG/mach.development.pong.unstripped.noctf
