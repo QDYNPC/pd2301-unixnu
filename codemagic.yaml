@@ -19,6 +19,14 @@ workflows:
           git checkout -q FETCH_HEAD
           echo "UniXNU at $(git rev-parse --short HEAD)"
 
+      - name: Install build tools
+        script: |
+          set -e
+          brew install ninja cmake || brew upgrade ninja cmake || true
+          for t in ninja cmake make git python3; do
+            printf '%-8s ' "$t"; command -v "$t" || echo MISSING
+          done
+
       - name: Install device profile and component recipe
         script: |
           set -e
