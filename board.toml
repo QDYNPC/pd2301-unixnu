@@ -1,0 +1,94 @@
+schema_version = 2
+
+[board]
+name = "pd2301"
+soc = "SM8475"
+soc_source = "sm8475"
+os_profile = "ipados-18.7.10-22H374"
+description = "iQOO Neo8 (PD2301, SM8475): UniXNU bring-up derived from Pong/zizhan"
+kit = "pong"
+
+# iPadOS 18.7.10 restore selected from the matching J171 BuildIdentity.
+[ipsw]
+url = "https://updates.cdn-apple.com/2026WinterFCS/fullrestores/140-97955/A3F72236-89AD-47C5-8394-5E824079C175/iPad_10.2_18.7.10_22H374_Restore.ipsw"
+product = "iPad7,11"
+version = "18.7.10"
+build = "22H374"
+device_class = "j171ap"
+chip_id = 0x8010
+board_id = 0x1c
+fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemOS", "Cryptex1,SystemTrustCache", "Cryptex1,AppOS", "Cryptex1,AppTrustCache", "OS"]
+
+[components]
+# This is the community Pong A730/QCA6490/Darwin24 implementation, not the A740/WCN7850 source.
+include = ["PongPlatform24"]
+
+[device_tree]
+source = "device:dts/pd2301.dts"
+include_dirs = ["soc:dts"]
+
+[kernel]
+defconfig = "zizhan_ipados18_gpu_defconfig"
+config_fragments = ["arch:configs/common.config", "soc:configs/sm8475.config", "os:configs/ipados.config"]
+patch_series = ["device:migration/format2/arch-darwin24.series", "soc:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu-ipados18/series"]
+archives = ["component:PongPlatform24"]
+
+
+# Local prelink and userdata entries are documented under migration/ipados18.
+[firmware]
+config = "zizhan"
+dsc = "Platforms/vivo/pd2301Pkg/pd2301.dsc"
+fd = "Build/pd2301Pkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
+patches = [
+  "Resources/MuPatches/AsmMacroLib.patch",
+  "Resources/MuPatches/Auth-Service.patch",
+  "Resources/MuPatches/Boot-Manager.patch",
+  "Resources/MuPatches/Timer.patch",
+  "Resources/MuPatches/Usb-Bus.patch",
+]
+packages = [
+  "{uefi}",
+  "{tree}/package",
+  "{tree}/drivers/DarwinBoot24",
+  "{edk2}",
+  "{uefi}/Platforms/Xiaomi",
+  "{uefi}/Platforms/Nothing",
+  "{uefi}/Common/Mu",
+  "{uefi}/Common/Mu_OEM_Sample",
+  "{uefi}/Silicon/Qualcomm",
+  "{uefi}/Silicon/Silicium",
+  "{uefi}/Silicium-ACPI",
+  "{uefi}/Silicium-ACPI/Platforms/Nothing",
+  "{uefi}/Silicium-ACPI/Silicon/Qualcomm",
+]
+
+[firmware.defines]
+DEVICE_MODEL = "0"
+ENABLE_SECUREBOOT = "0"
+MEMORY_PROTECTION = "TRUE"
+SHIP_MODE = "FALSE"
+BUILDID_STRING = "UniXNU-Zizhan"
+PONG_INITRD_DISK_ENABLED = "1" # Set 0 to isolate SEC/HOB without the disk DXE.
+
+[payload]
+title = "Zizhan iPadOS 18.7.10"
+[payload.adt]
+packed_data_ramdisk = false
+
+[package]
+# scripts/package.sh resolves this path relative to the device repository. The
+# checkout is a local build input and is intentionally not vendored here.
+unixnu = "../UniXNU"
+
+[package.defconfig]
+"ipados-18.7.10-22H374" = "zizhan_ipados18_gpu_defconfig"
+
+[pong_build]
+entry = "scripts/build-pong-format2.py"
+kernel_entry = "scripts/build-ipados18-pong-macos.py"
+boot_entry = "scripts/build-ipados18-prelinked-boot.py"
+cpus = 8
+# The matching Darwin24 prelinker derives relocation from the 22H374 ABI record.
+# The generic Darwin23 prelink/boot entry is intentionally not selected here.
+
+

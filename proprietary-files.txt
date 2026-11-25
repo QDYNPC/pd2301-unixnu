@@ -1,0 +1,15 @@
+# Fetch from the matching iPadOS 18.7.10 / 22H374 iPad7,11 restore in board.toml.
+# Apple components remain in local ignored directories.
+KernelCache
+DeviceTree
+StaticTrustCache
+Cryptex1,SystemOS
+Cryptex1,SystemTrustCache
+Cryptex1,AppOS
+Cryptex1,AppTrustCache
+OS
+# zizhan firmware comes from the phone's own partitions (MIUI V14.0.15.0.TLRCNXM):
+#   /vendor/firmware/a730_sqe.fw, gmu_gen70000.bin, a730_zap.mdt, a730_zap.b01, a730_zap.b02 -> PONG_ADRENO_FIRMWARE
+#   /vendor/firmware_mnt/image/adsp.mdt + adsp.b00..b25 (modem partition) -> adsp.mbn via tools/zizhan/mdt2mbn.py
+# tools/zizhan/phone/collect.sh copies the Adreno files (and the live DT) off the phone; pull adsp.* with adb.
+# No firmware binaries are stored in this repository.

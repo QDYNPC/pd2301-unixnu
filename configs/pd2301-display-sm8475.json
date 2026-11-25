@@ -1,0 +1,29 @@
+{
+  "board": "pd2301",
+  "panel": "qcom,mdss_dsi_pd2301_boe_nt37705_144hz_dv3_fhdplus_dsc_cmd",
+  "source": "PD2301 live DT (/sys/firmware/fdt): dsi-ctrl-hw-v2.6 @0xae94000, dsi-phy-v4.3.2 @0xae94900, cmd mode DSC",
+  "width": 1260,
+  "height": 2800,
+  "modes_hz": [60, 90, 120, 144],
+  "display_domain_observer": {
+    "source": "TODO: read from PD2301 DT apps-smmu / smmu_sde_unsec_cb nodes",
+    "base": "0x0",
+    "register_bytes": 0,
+    "version": 1,
+    "group": 0,
+    "bank": 0,
+    "sid": "0x0",
+    "mask": "0x0",
+    "cba2r": 1
+  },
+  "brightness": {
+    "source": "TODO: vivo private backlight i2c; verify from DT",
+    "controller": "0x0",
+    "register_bytes": 0,
+    "maximum": 2047,
+    "minimum_nonzero": 4,
+    "bl_inverted_dfb": true,
+    "channel": 0,
+    "version": 2
+  }
+}

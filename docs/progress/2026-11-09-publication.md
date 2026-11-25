@@ -1,0 +1,51 @@
+# 11-08/09 累计内容发布
+
+## 发布范围
+
+用户要求 commit/push，并核对整体交接是否还有工作树内容未进入 main。权威设备仓库入口为 `power02-panelpool-128`，HEAD `fbf5b1b39c1784f0d8df7f8dd1a9dbd582ddfb39`；fetch 后 origin/main 仍为 `087416a4eb083032b2a4fbb43617f76a11d41c36`。入口无未提交或未跟踪文件、无stash、只有一个worktree；28个提交共46个文件尚未进入main。
+
+本批包括128MiB面板池规划、显示owner记账和默认关闭的DSI/ADSP观察与运输控制、CPU退出调用契约、截图采样/裁剪与round-report工具、可选pong_open入口，以及日期证据与天气交接。设备资格以各轮记录为准：panel off/真睡眠没有完成，pong_open设备成功未验证、当前已安装UI不含该入口，天气仍未修好。
+
+只向 `qiumochen/UniXNU-zizhan` 的 origin/main 正常快进推送，不强推、不推上游。其他checkout/本机镜像、凭据、原始DT、日志和本地操作脚本不混入此仓库；整体本机清单在仓库外交接。本次发布不启动手机、不安装OS/UI或固件。
+
+## 推送前验证
+
+- 本机重新构建 `pong_ipados18_ci_defconfig` 和 `zizhan_ipados18_gpu_defconfig` 均 `KERNEL_DONE`；最后构建为完整默认profile。相对累计运行时代码没有新增内核改动。
+- 精简内核SHA256：`8099a3f97d407b2eec7eb47c9bfe6fa62585b2658e603e8b9552559221542ea4`；完整默认：`d15a48e82bde9217dbf1cdddcf6c97eb8739ed1456b9a35f8d94112656e6f090`。构建成功不等于设备资格。
+- 日用和显示主机回归通过。Wi-Fi首次使用脚本旧默认shared路径失败（输入不存在），显式指定本机已准备的Ath12kWifi共享源后回归全部通过，原负记录保留。
+- 在仓库外隔离目录重新编译并4KiB签名UI helper通过，canonical UI hash仍为 `c3897b10cc22c1be310d3f121b080731052c819be56979a236d76a4ce2fb4388`；没有安装它。
+- 对全部累计新增文本作个人路径、设备唯一标识、常见凭据赋值扫描，无命中；发布完整diff已审查。
+- 0021补丁包含unified-diff上下文行的空格/制表符；默认`git diff --check`会对补丁文本告警，不能删除上下文空格破坏patch。禁用blank-at-eol/space-before-tab这两类检查后累计diff通过，实际patch应用回放与owner主机回归通过；普通新文档diff检查保持默认。
+- 累计porting增量检查首次指出configuration、firmware、input区域未更新证据；本发布提交补齐，重新按固定`e67a79eb64012e8f30ba04c56ea37753bdb720a2`检查结构和相对推送前main的完整增量。不是用等于HEAD的base得到空比较。
+
+## 云端CI与发布收口
+
+推送前尚无本次SHA的CI结果。只跟踪该SHA实际触发的Porting record、Daily-use、Display和Wi-Fi主机回归；macOS内核工作流为手动，不把未运行项写为PASS，不继承其他SHA的绿色状态。推送和CI完成结果在下方追加；最终机器操作状态留本机交接。
+
+### 首次推送结果与测试修正
+
+`32add9f87305b37dac0a4ff81fd52d966aebc709` 已正常推送main，Porting record（42544541744）、Display（42544542000）、Wi-Fi（42544541742）SUCCESS；Daily-use（42544541994）FAIL。失败位于测试 `dsi-command.cpp`：GCC将 `condition ? DmaBusy : 0` 的枚举/非枚举混用作为`-Wextra -Werror`拒绝，本机Clang未报该告警。
+
+修正只把mock读回值显式写为 `uint32_t(DmaBusy)` 和 `0u`，保持寄存器故障回放语义及所有运行时代码。重新运行完整日用host并跟踪修正SHA；首次失败保留，不重跑相同失败输入掩盖问题。此修正不需重建未改内核，不代表设备功能变化。
+
+### 修正SHA与剩余手动构建
+
+修正提交 `de1ce138c3dbfe11eda7038d18d6a99f62304909` 已推送main，Daily-use host（42544793964）与Porting record（42544794048）均SUCCESS。该提交只改测试与证据，未触发Display/Wi-Fi；它们在运行时代码相同的首次发布SHA `32add9f87305b37dac0a4ff81fd52d966aebc709` 上SUCCESS，不冒充修正SHA的新执行。
+
+按阶段发布规则，在 `de1ce138c3dbfe11eda7038d18d6a99f62304909` 手动触发macOS精简内核构建：[run 42544865898](https://github.com/qiumochen/UniXNU-zizhan/actions/runs/42544865898)。没有提供固件或Apple restore输入，disk-probe SKIP；本地完整默认/精简内核结果独立保留。09:24检查该run仍在Tools阶段，状态RUNNING，不记PASS。后续由有界自动复查跟踪该精确SHA，遇失败保留并修正可处理原因，不用别的SHA结果替代。
+
+设备仓库main已包含原开发分支全部提交、无stash/额外worktree/未提交内容；独立UEFI checkout、参考构建输入、旧pre-publish镜像与仓库外机器工件不属于本次main合并，详细路径与逐文件清单保留本机交接。Git源码发布未改变手机已安装OS候选，也未提升天气/睡眠资格。
+
+### 手动云端内核完成，发布尾项收口
+
+2026-11-09 09:45（UTC+8），手动 [macOS build 42544865898](https://github.com/qiumochen/UniXNU-zizhan/actions/runs/42544865898) 在精确提交 `de1ce138c3dbfe11eda7038d18d6a99f62304909` 完成 **SUCCESS**；DarwinBoot24与Compile CI kernel通过，日志包含 `kernel_built: true` 与真实kernel输出路径。没有固件/restore输入，本次仅精简内核，disk-probe为SKIP；不把该结果当完整GPU/Wi-Fi镜像或设备验证。完整默认与精简配置的本机构建仍为独立证据。
+
+| 提交 | 实际执行项 | 结果 / 运行ID |
+| --- | --- | --- |
+| `32add9f87305b37dac0a4ff81fd52d966aebc709` | Porting / Display / Wi-Fi | SUCCESS：42544541744 / 42544542000 / 42544541742 |
+| 同上 | Daily-use首次执行 | FAIL：42544541994，GCC mock类型告警，原负结果保留 |
+| `de1ce138c3dbfe11eda7038d18d6a99f62304909` | Daily-use / Porting | SUCCESS：42544793964 / 42544794048 |
+| 同上 | 手动macOS精简内核 | SUCCESS：42544865898；disk-probe SKIP |
+| `3cee4a5edb002453c1ed7fd93462302a745abf36` | 文档Porting | SUCCESS：42545447629，未重复触发其余回归 |
+
+本次运行时代码累计发布、GCC测试修正和手动内核验证已完成。此追加仅记录结果，不改运行时代码、不操作手机或独立UEFI；文档收口提交自身只跟踪实际触发的Porting检查，最终SHA与结果同步本机交接，完成后停止自动复查。独立UEFI与旧mirror待办保持原样，不能因此称为全部工程已发布。

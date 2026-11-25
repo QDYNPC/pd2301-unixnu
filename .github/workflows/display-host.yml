@@ -1,0 +1,66 @@
+name: Display host regressions
+on:
+  push:
+    paths:
+      - '.github/workflows/display-host.yml'
+      - '.github/actions/**'
+      - 'board.toml'
+      - 'feeds.toml'
+      - 'unixnu.lock'
+      - 'configs/**'
+      - 'dts/**'
+      - 'migration/format2/**'
+      - 'scripts/**'
+      - 'patches/xnu-ipados18/**'
+      - 'drivers/PongPower/**'
+      - 'drivers/PongAdreno/**'
+      - 'userland/ui_compat18.c'
+      - 'tools/zizhan/mac/check-display-host.py'
+      - 'tools/zizhan/mac/frame-latency.py'
+      - 'tools/zizhan/mac/shot*.py'
+      - 'tools/zizhan/tests/frame-latency.py'
+      - 'tools/zizhan/tests/shot-integrity.py'
+      - 'tools/zizhan/tests/shot-timing.c'
+      - 'tools/zizhan/tests/brightness-curve.py'
+      - 'tools/zizhan/tests/dsi-lease.c'
+      - '!**/*.md'
+      - '!**/*.rst'
+  pull_request:
+    paths:
+      - '.github/workflows/display-host.yml'
+      - '.github/actions/**'
+      - 'board.toml'
+      - 'feeds.toml'
+      - 'unixnu.lock'
+      - 'configs/**'
+      - 'dts/**'
+      - 'migration/format2/**'
+      - 'scripts/**'
+      - 'patches/xnu-ipados18/**'
+      - 'drivers/PongPower/**'
+      - 'drivers/PongAdreno/**'
+      - 'userland/ui_compat18.c'
+      - 'tools/zizhan/mac/check-display-host.py'
+      - 'tools/zizhan/mac/frame-latency.py'
+      - 'tools/zizhan/mac/shot*.py'
+      - 'tools/zizhan/tests/frame-latency.py'
+      - 'tools/zizhan/tests/shot-integrity.py'
+      - 'tools/zizhan/tests/shot-timing.c'
+      - 'tools/zizhan/tests/brightness-curve.py'
+      - 'tools/zizhan/tests/dsi-lease.c'
+      - '!**/*.md'
+      - '!**/*.rst'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  ownership:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: '3.12'
+      - name: Replay display command ownership
+        run: python3 tools/zizhan/mac/check-display-host.py --cc clang

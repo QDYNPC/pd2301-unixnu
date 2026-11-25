@@ -1,0 +1,32 @@
+name: Porting record
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: e67a79eb64012e8f30ba04c56ea37753bdb720a2
+          path: tools
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Add Pong community component metadata
+        run: cat device/migration/format2/components.toml >> tools/components.toml
+      - name: Check structure and changed areas
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          set -euo pipefail
+          python3 tools/scripts/porting-record.py check --device device
+          if [[ -n "$BASE" && ! "$BASE" =~ ^0+$ ]]; then
+            git -C device cat-file -e "${BASE}^{commit}" || git -C device fetch origin "$BASE"
+            python3 tools/scripts/porting-record.py check --device device --base "$BASE"
+          fi
