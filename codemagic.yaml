@@ -2,7 +2,7 @@ workflows:
   pd2301-kernel:
     name: PD2301 kernel (macOS)
     instance_type: mac_mini_m2
-    max_build_duration: 180
+    max_build_duration: 120
     environment:
       xcode: latest
       vars:
@@ -37,6 +37,4 @@ workflows:
           ./unixnu build kernel -D "$CM_BUILD_DIR" -j6
 
     artifacts:
-      - "$HOME/UniXNU/out/**/*.pong"
-      - "$HOME/UniXNU/out/**/mach.development.*"
-      - "$HOME/UniXNU/out/**/*.log"
+      - "*.log"
