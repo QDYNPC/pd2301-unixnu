@@ -14,7 +14,10 @@ import struct
 import subprocess
 import sys
 import tempfile
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 import zlib
 
 ROOT = Path(__file__).resolve().parents[2]

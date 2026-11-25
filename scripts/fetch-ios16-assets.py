@@ -16,7 +16,10 @@ from pathlib import Path
 import plistlib
 import struct
 import sys
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 import urllib.request
 import zipfile
 import zlib

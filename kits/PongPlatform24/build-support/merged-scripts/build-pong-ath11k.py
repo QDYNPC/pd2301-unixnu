@@ -1,0 +1,954 @@
+#!/usr/bin/env python3
+"""Build Linux 7.0.14 ath11k PCI/MHI using UniXNU's shared Wi-Fi ABI.
+
+Sources are local public Linux and UniXNU Ath12kWifi checkouts.
+The driver is not replaced by success stubs. Missing core symbols fail the
+link recipe; power/DMA/MSI remain the consuming Pong board's responsibility.
+"""
+import argparse
+import sys
+from concurrent.futures import ThreadPoolExecutor
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import shutil
+from pong_native_inputs import build_env, input_path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT/'scripts'))
+import pong_paths
+
+
+def t970_edits(gen, mhi, shared, out):
+    """SM-T970 (QCA6390 hw2.0). Returns the nw_qrtr.c to compile. Every anchor must match exactly once.
+
+    1. debug.c: XNU's vsnprintf has no %pV, so every ath11k_info/warn/err line printed as "0x...V". The message is
+       formatted first. Boot and QMI debug lines (ATH11K_DBG_BOOT | ATH11K_DBG_QMI = 0x60) print as well.
+    2. pci.c: the WLAON power control write also clears SHUTDOWN_EN (bit 0), as Qualcomm's cnss2 does for this chip.
+    3. nw_qrtr.c: the firmware announces its servers (WLFW) only to a node whose HELLO reached its name service after
+       its own. The module answers no remote HELLO once it has sent one; on the same tablet that left QMI silent in
+       two runs of three (UniXNU-gts7xlwifi docs/wifi-sources.md, combo5). The first remote HELLO is answered once.
+    4. MHI main.c: a transfer event the host does not know (the same tablet stopped on 0x11, BAD_TRE, in the board
+       file download) is logged with its channel, its words, the ring offsets, the TRE it names and the channel
+       context as the device left it.
+    """
+    def edit(target, pairs, source=None):
+        text = (source or target).read_text()
+        for old, new in pairs:
+            if text.count(old) != 1:
+                raise RuntimeError('T970: %s differs at %r (%d)' % (target.name, old[:50], text.count(old)))
+            text = text.replace(old, new)
+        if target.is_symlink() or target.exists():
+            target.unlink()
+        target.write_text(text)
+
+    fmt = ('\t{ va_list t970c; char t970b[224]; va_copy(t970c, args); vsnprintf(t970b, sizeof t970b, fmt, t970c); '
+           'va_end(t970c);\n\t  %s }\n')
+    edit(gen / 'debug.c', [
+        ('\tdev_info(ab->dev, "%pV", &vaf);\n', fmt % 'dev_info(ab->dev, "%s", t970b);'),
+        ('\tdev_err(ab->dev, "%pV", &vaf);\n', fmt % 'dev_err(ab->dev, "%s", t970b);'),
+        ('\tdev_warn_ratelimited(ab->dev, "%pV", &vaf);\n', fmt % 'dev_warn(ab->dev, "%s", t970b);'),
+        ('\tif (ath11k_debug_mask & mask)\n\t\tdev_printk(KERN_DEBUG, ab->dev, "%s %pV", ath11k_dbg_str(mask), &vaf);\n',
+         '\tif ((ath11k_debug_mask | 0x60) & mask)\n'
+         + fmt % 'dev_info(ab->dev, "%s %s", ath11k_dbg_str(mask), t970b);'),
+    ])
+    edit(gen / 'pci.c', [
+        ('\tval &= ~QFPROM_PWR_CTRL_VDD4BLOW_MASK;\n', '\tval &= ~(QFPROM_PWR_CTRL_VDD4BLOW_MASK | 0x1);\n'),
+    ])
+    qrtr = out / 'nw_qrtr_t970.c'
+    edit(qrtr, [
+        ('static int g_hello_sent;\n',
+         'static int g_hello_sent;\nstatic int g_hello_answered;   /* SM-T970: a remote HELLO has been answered */\n'),
+        ('    if (src_node != LOCAL_NODE && !g_hello_sent) { g_hello_sent = 1; send_remote(',
+         '    if (src_node != LOCAL_NODE && (!g_hello_sent || !g_hello_answered)) { g_hello_sent = 1; g_hello_answered = 1;\n'
+         '      lx_log(6, "qrtr: HELLO from node %u answered", src_node); send_remote('),
+        ('  g_xmit = 0; g_hello_sent = 0;\n', '  g_xmit = 0; g_hello_sent = 0; g_hello_answered = 0;\n'),
+        ('  g_xmit = xmit; g_ctx = ctx; g_hello_sent = xmit != 0;\n',
+         '  g_xmit = xmit; g_ctx = ctx; g_hello_sent = xmit != 0; g_hello_answered = 0;\n'),
+        ('  if (len < sizeof *p) return;\n  switch (le32_to_cpu(p->cmd)) {\n',
+         '  if (len < sizeof *p) return;\n'
+         '  if (src_node != LOCAL_NODE) lx_log(6, "qrtr: ctrl %u from %u:%u svc %x", le32_to_cpu(p->cmd), src_node, src_port,\n'
+         '                                     le32_to_cpu(p->server.service));\n'
+         '  switch (le32_to_cpu(p->cmd)) {\n'),
+    ], source=shared / 'src/nw_qrtr.c')
+    edit(mhi / 'main.c', [
+        ('\tdefault:\n\t\tdev_err(dev, "Unknown event 0x%x\\n", ev_code);\n\t\tbreak;\n',
+         '\tdefault:\n\t{\n'
+         '\t\tdma_addr_t t970p = MHI_TRE_GET_EV_PTR(event);\n'
+         '\t\tstruct mhi_ring_element *t970t = is_valid_ring_ptr(tre_ring, t970p) ? mhi_to_virtual(tre_ring, t970p) : NULL;\n'
+         '\t\tconst __le32 *t970w = (const __le32 *)&mhi_cntrl->mhi_ctxt->chan_ctxt[mhi_chan->chan];\n'
+         '\t\tdev_err(dev, "Unknown event 0x%x ch %u ev %llx %08x %08x ring %llx+%x rp %x wp %x\\n", ev_code, mhi_chan->chan,\n'
+         '\t\t\t(unsigned long long)le64_to_cpu(event->ptr), le32_to_cpu(event->dword[0]), le32_to_cpu(event->dword[1]),\n'
+         '\t\t\t(unsigned long long)tre_ring->iommu_base, (unsigned)tre_ring->len,\n'
+         '\t\t\t(unsigned)((u8 *)tre_ring->rp - (u8 *)tre_ring->base), (unsigned)((u8 *)tre_ring->wp - (u8 *)tre_ring->base));\n'
+         '\t\tif (t970t)\n'
+         '\t\t\tdev_err(dev, "t970: TRE %llx %08x %08x\\n", (unsigned long long)le64_to_cpu(t970t->ptr),\n'
+         '\t\t\t\tle32_to_cpu(t970t->dword[0]), le32_to_cpu(t970t->dword[1]));\n'
+         '\t\tdev_err(dev, "t970: ctxt %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\\n", le32_to_cpu(t970w[0]),\n'
+         '\t\t\tle32_to_cpu(t970w[1]), le32_to_cpu(t970w[2]), le32_to_cpu(t970w[3]), le32_to_cpu(t970w[4]),\n'
+         '\t\t\tle32_to_cpu(t970w[5]), le32_to_cpu(t970w[6]), le32_to_cpu(t970w[7]), le32_to_cpu(t970w[8]),\n'
+         '\t\t\tle32_to_cpu(t970w[9]), le32_to_cpu(t970w[10]));\n'
+         '\t\tbreak;\n\t}\n'),
+    ])
+    # 5. nw_sta.c (the copy with the kernel's entropy source): the station sends the key handshake as 802.11 data
+    #    frames while every other frame goes out as an Ethernet frame the firmware converts. On this tablet the
+    #    association succeeded and the access point then never accepted handshake message 2 (four retries, reason
+    #    2). With nw_wifi_t970_eapol_eth (default 1, the board can clear it before the start) the handshake frames
+    #    take the Ethernet path too, as the stock Android driver sends them to this firmware.
+    edit(out / 'nw_sta_pong.c', [
+        ('static void send_eapol(const struct eapol_key *k, unsigned total) {\n',
+         'volatile int nw_wifi_t970_eapol_eth = 1;\n'
+         'static void send_eapol(const struct eapol_key *k, unsigned total) {\n'
+         '  if (nw_wifi_t970_eapol_eth) { u8 e[14 + 512]; if (total > 512) return;\n'
+         '    memcpy(e, C.ap.bssid, 6); memcpy(e + 6, g_vif->addr, 6); e[12] = 0x88; e[13] = 0x8e; memcpy(e + 14, k, total);\n'
+         '    tx_eth(e, 14 + total); return; }\n'),
+    ])
+    # 7. On this tablet 15-20 % of the non-beacon frames vanished inside nw_sta_rx() without a count, TCP retransmitted
+    #    ~9 % of its segments on timeouts, and the data frames' transmit results were thrown away (only EAPOL is
+    #    counted). Count the receive drops by reason (action frames, Block Ack, ADDBA requests, data not from the
+    #    access point, to_eth() short / not LLC (keep the first such frame's 8 bytes, frame control and flags),
+    #    Ethernet-form frames dropped (EAPOL among them), other non-data) and the transmit results by length
+    #    (acknowledged / not / freed without status). The station never answered the access point's ADDBA request;
+    #    it now declines it (status 37), so the access point stops negotiating and sends unaggregated frames.
+    #    nw_wifi_t970_rx_stats(b, n, 0|1) gives the board the two lines.
+    edit(out / 'nw_mac80211_pong.c', [
+        ('unsigned nw_eapol_tx[3];\n',
+         'unsigned nw_eapol_tx[3];\n'
+         'unsigned nw_wifi_t970_tx[3][3];   /* [< 128, < 600, larger][acknowledged, not, freed without status] */\n'
+         'static int t970_len(const struct sk_buff *s) { return s->len < 128 ? 0 : s->len < 600 ? 1 : 2; }\n'),
+        ('void ieee80211_free_txskb(struct ieee80211_hw *hw, struct sk_buff *skb) { (void)hw; ',
+         'void ieee80211_free_txskb(struct ieee80211_hw *hw, struct sk_buff *skb) { (void)hw; if (skb) nw_wifi_t970_tx[t970_len(skb)][2]++; '),
+        ('void ieee80211_tx_status_irqsafe(struct ieee80211_hw *hw, struct sk_buff *skb) { (void)hw; ',
+         'void ieee80211_tx_status_irqsafe(struct ieee80211_hw *hw, struct sk_buff *skb) { (void)hw; if (skb) nw_wifi_t970_tx[t970_len(skb)][2]++; '),
+        ('  (void)hw; if (!st || !st->skb) return;\n',
+         '  (void)hw; if (!st || !st->skb) return;\n'
+         '  nw_wifi_t970_tx[t970_len(st->skb)][!(IEEE80211_SKB_CB(st->skb)->flags & IEEE80211_TX_STAT_ACK)]++;\n'),
+    ])
+    edit(out / 'nw_sta_pong.c', [
+        ('static void to_eth(struct sk_buff *skb) {\n',
+         'unsigned nw_wifi_t970_rxd[12]; static u8 nw_t970_nollc[8];\n'
+         'static void to_eth(struct sk_buff *skb) {\n'),
+        ('  if (skb->len < hl + 8) return;\n  const u8 *llc = skb->data + hl; if (llc[0] != 0xaa || llc[1] != 0xaa || llc[2] != 3) return;\n',
+         '  if (skb->len < hl + 8) { nw_wifi_t970_rxd[5]++; return; }\n'
+         '  const u8 *llc = skb->data + hl; if (llc[0] != 0xaa || llc[1] != 0xaa || llc[2] != 3) {\n'
+         '    if (!nw_wifi_t970_rxd[6]++) { memcpy(nw_t970_nollc, llc, 8); nw_wifi_t970_rxd[10] = le16_to_cpu(h->frame_control); nw_wifi_t970_rxd[11] = (unsigned)st->flag; }\n'
+         '    return; }\n'),
+        ('      if (skb->len >= 14 && !(skb->data[12] == 0x88 && skb->data[13] == 0x8e) && C.state >= NW_STA_KEYS && g_ev.rx) g_ev.rx(skb->data, skb->len);\n',
+         '      if (skb->len >= 14 && !(skb->data[12] == 0x88 && skb->data[13] == 0x8e) && C.state >= NW_STA_KEYS && g_ev.rx) g_ev.rx(skb->data, skb->len);\n'
+         '      else { nw_wifi_t970_rxd[7]++; if (skb->len >= 14 && skb->data[12] == 0x88 && skb->data[13] == 0x8e) nw_wifi_t970_rxd[8]++; }\n'),
+        ('void nw_sta_rx(struct sk_buff *skb) {\n',
+         '/* ADDBA Response declining the access point\'s request: category 3 (Block Ack), action 1, its dialog token,\n'
+         ' * status 37 (request declined), its parameter set, timeout 0. */\n'
+         'static void t970_addba_decline(const u8 *req) {\n'
+         '  struct sk_buff *skb = new_frame(9); if (!skb) return;\n'
+         '  mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_ACTION);\n'
+         '  u8 *b = skb_put_zero(skb, 9); b[0] = 3; b[1] = 1; b[2] = req[2]; b[3] = 37; b[4] = 0; b[5] = req[3]; b[6] = req[4];\n'
+         '  tx_frame(skb); }\n'
+         'extern unsigned nw_wifi_t970_tx[3][3];\n'
+         'void nw_wifi_t970_rx_stats(char *b, int n, int which) {\n'
+         '  const unsigned *r = nw_wifi_t970_rxd; if (n <= 0) return;\n'
+         '  if (!which) snprintf(b, n, "rx drop: action %u back %u addba %u declined %u, not-ap %u, short %u, no-llc %u, 8023 %u (eapol %u), other %u",\n'
+         '    r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]);\n'
+         '  else snprintf(b, n, "tx ack/nack/free small %u/%u/%u mid %u/%u/%u large %u/%u/%u; no-llc first %02x%02x%02x%02x%02x%02x%02x%02x fc %x flag %x",\n'
+         '    nw_wifi_t970_tx[0][0], nw_wifi_t970_tx[0][1], nw_wifi_t970_tx[0][2], nw_wifi_t970_tx[1][0], nw_wifi_t970_tx[1][1], nw_wifi_t970_tx[1][2],\n'
+         '    nw_wifi_t970_tx[2][0], nw_wifi_t970_tx[2][1], nw_wifi_t970_tx[2][2], nw_t970_nollc[0], nw_t970_nollc[1], nw_t970_nollc[2], nw_t970_nollc[3],\n'
+         '    nw_t970_nollc[4], nw_t970_nollc[5], nw_t970_nollc[6], nw_t970_nollc[7], r[10], r[11]); }\n'
+         'void nw_sta_rx(struct sk_buff *skb) {\n'),
+        ('  if (ieee80211_is_mgmt(h->frame_control)) { on_mgmt(skb); return; }\n',
+         '  if (ieee80211_is_action(h->frame_control) && skb->len >= 26 && !memcmp(h->addr2, C.ap.bssid, 6)) {\n'
+         '    const u8 *a = skb->data + 24; nw_wifi_t970_rxd[0]++;\n'
+         '    if (a[0] == 3) { nw_wifi_t970_rxd[1]++;\n'
+         '      if (a[1] == 0 && skb->len >= 33) { nw_wifi_t970_rxd[2]++; if (C.state >= NW_STA_KEYS) { t970_addba_decline(a); nw_wifi_t970_rxd[3]++; } } } }\n'
+         '  if (ieee80211_is_mgmt(h->frame_control)) { on_mgmt(skb); return; }\n'
+         '  if (!ieee80211_is_data(h->frame_control)) nw_wifi_t970_rxd[9]++;\n'
+         '  else if (memcmp(h->addr2, C.ap.bssid, 6)) nw_wifi_t970_rxd[4]++;\n'),
+    ])
+    # 8. Block Ack accepted instead of declined (edit 7 declined it: no loss, but no receive aggregation), DELBA
+    #    handled, receive window 64 (it was 8); 9. rekeys logged, a pairwise rekey's keys installed while connected
+    #    (they were derived and never installed); 10. transmit completions by reason (dp_tx.c) in a third line.
+    edit(out / 'nw_sta_pong.c', [("/* ADDBA Response declining the access point's request: category 3 (Block Ack), action 1, its dialog token,\n * status 37 (request declined), its parameter set, timeout 0. */\nstatic void t970_addba_decline(const u8 *req) {\n  struct sk_buff *skb = new_frame(9); if (!skb) return;\n  mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_ACTION);\n  u8 *b = skb_put_zero(skb, 9); b[0] = 3; b[1] = 1; b[2] = req[2]; b[3] = 37; b[4] = 0; b[5] = req[3]; b[6] = req[4];\n  tx_frame(skb); }\n", '/* Block Ack with the access point (net/mac80211/agg-rx.c, without mac80211): an ADDBA request is accepted through\n * ath11k\'s ampdu_action (it updates the REO queue of that TID; nothing goes on the air) and answered by this ADDBA\n * response: category 3, action 1, the request\'s dialog token, status, our parameter set (A-MSDU in A-MPDU as ath11k\n * supports it, immediate policy, the TID, the window), the request\'s timeout. A DELBA from the access point that ends\n * its sending session stops ours. */\nstatic void t970_addba_resp(const u8 *req, u16 status, u16 tid, u16 buf) {\n  struct sk_buff *skb = new_frame(9); if (!skb) return;\n  mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_ACTION);\n  u16 capab = 1 | 1 << 1 | (tid & 15) << 2 | (buf & 0x3ff) << 6;\n  u8 *b = skb_put_zero(skb, 9); b[0] = WLAN_CATEGORY_BACK; b[1] = WLAN_ACTION_ADDBA_RESP; b[2] = req[2];\n  b[3] = status; b[4] = status >> 8; b[5] = capab; b[6] = capab >> 8; b[7] = req[5]; b[8] = req[6];\n  tx_frame(skb); }\nstatic void t970_back(const u8 *a, unsigned len) {\n  struct ieee80211_ampdu_params p = { .sta = C.sta };\n  if (a[1] == WLAN_ACTION_ADDBA_REQ && len >= 9) {\n    u16 capab = a[3] | a[4] << 8, buf = capab >> 6, status = WLAN_STATUS_REQUEST_DECLINED;\n    u16 max = C.sta->deflink.he_cap.has_he ? IEEE80211_MAX_AMPDU_BUF_HE : IEEE80211_MAX_AMPDU_BUF_HT;\n    p.tid = (capab >> 2) & 15;\n    if (p.tid < IEEE80211_FIRST_TSPEC_TSID && C.sta->deflink.ht_cap.ht_supported) {\n      if (!(capab & 2) || buf > max) status = WLAN_STATUS_INVALID_QOS_PARAM;\n      else {\n        if (!buf) buf = max;\n        if (buf > C.sta->max_rx_aggregation_subframes) buf = C.sta->max_rx_aggregation_subframes;\n        p.action = IEEE80211_AMPDU_RX_START; p.buf_size = buf; p.timeout = a[5] | a[6] << 8;\n        p.ssn = (u16)(a[7] | a[8] << 8) >> 4;\n        int r = g_ops->ampdu_action(g_hw, g_vif, &p);\n        if (!r) { status = WLAN_STATUS_SUCCESS; nw_wifi_t970_rxd[3]++; }\n        else lx_log(4, "wifi: rx block ack tid %u refused by the driver: %d", p.tid, r); } }\n    lx_log(6, "wifi: block ack request tid %u window %u ssn %u -> status %u", p.tid, buf, p.ssn, status);\n    t970_addba_resp(a, status, p.tid, buf);\n  } else if (a[1] == WLAN_ACTION_DELBA && len >= 6) {\n    u16 params = a[2] | a[3] << 8;\n    if (!(params & IEEE80211_DELBA_PARAM_INITIATOR_MASK)) return;   /* it ends our sending session: the firmware\'s */\n    p.action = IEEE80211_AMPDU_RX_STOP; p.tid = params >> 12;\n    int r = g_ops->ampdu_action(g_hw, g_vif, &p);\n    lx_log(6, "wifi: block ack tid %u ended by the access point (%d)", p.tid, r); } }\n'), ('  if (ieee80211_is_action(h->frame_control) && skb->len >= 26 && !memcmp(h->addr2, C.ap.bssid, 6)) {\n    const u8 *a = skb->data + 24; nw_wifi_t970_rxd[0]++;\n    if (a[0] == 3) { nw_wifi_t970_rxd[1]++;\n      if (a[1] == 0 && skb->len >= 33) { nw_wifi_t970_rxd[2]++; if (C.state >= NW_STA_KEYS) { t970_addba_decline(a); nw_wifi_t970_rxd[3]++; } } } }\n', '  if (ieee80211_is_action(h->frame_control) && skb->len >= 26 && !memcmp(h->addr2, C.ap.bssid, 6)) {\n    const u8 *a = skb->data + 24; nw_wifi_t970_rxd[0]++;\n    if (a[0] == WLAN_CATEGORY_BACK) { nw_wifi_t970_rxd[1]++;\n      if (a[1] == WLAN_ACTION_ADDBA_REQ) nw_wifi_t970_rxd[2]++;\n      if (C.sta && C.state >= NW_STA_KEYS) t970_back(a, skb->len - 24); } }\n'), ('addba %u declined %u,', 'addba %u accepted %u,'), ('sta->max_rx_aggregation_subframes = 8;', 'sta->max_rx_aggregation_subframes = 64;'), ('  else snprintf(b, n, "tx ack/nack/free small', '  else if (which == 2) snprintf(b, n, "tx tqm acked %u rem-mpdu %u rem-tx %u rem-notx %u aged %u r5 %u r6 %u r7 %u fw %u retries %u; htt ok %u drop %u ttl %u reinj %u inspect %u",\n    nw_wifi_t970_tqm[0], nw_wifi_t970_tqm[1], nw_wifi_t970_tqm[2], nw_wifi_t970_tqm[3], nw_wifi_t970_tqm[4], nw_wifi_t970_tqm[5],\n    nw_wifi_t970_tqm[6], nw_wifi_t970_tqm[7], nw_wifi_t970_tqm[8], nw_wifi_t970_tqm[9], nw_wifi_t970_htt[0], nw_wifi_t970_htt[1],\n    nw_wifi_t970_htt[2], nw_wifi_t970_htt[3], nw_wifi_t970_htt[4]);\n  else snprintf(b, n, "tx ack/nack/free small'), ('extern unsigned nw_wifi_t970_tx[3][3];\n', 'extern unsigned nw_wifi_t970_tx[3][3];\nextern unsigned nw_wifi_t970_tqm[10], nw_wifi_t970_htt[8];   /* dp_tx.c, edit 10 */\n'), ("  if (pairwise && ack && !mic) {   /* message 1: the access point's nonce */\n", '  if (pairwise && ack && !mic) {   /* message 1: the access point\'s nonce */\n    if (C.state == NW_STA_UP) lx_log(6, "wifi: pairwise rekey: message 1 while connected");\n'), ('    C.hs_stage = 3; C.m4_done = 0; C.m4_at = lx_now_ms(); return; }\n', '    C.hs_stage = 3; C.m4_done = 0; C.m4_at = lx_now_ms();\n    if (C.state == NW_STA_UP) { install_keys(); lx_log(6, "wifi: pairwise rekey: new keys installed"); }\n    return; }\n'), ('  if (!pairwise && ack) {   /* group key update */\n', '  if (!pairwise && ack) {   /* group key update */\n    lx_log(6, "wifi: group key update%s", gtk && gtklen >= 16 ? "" : " without a key");\n')])
+    edit(gen / 'dp_tx.c', [('static void\nath11k_dp_tx_process_htt_tx_complete(struct ath11k_base *ab,\n', '/* SM-T970: transmit completions by TQM release reason ([0..7]), from the firmware ([8]), retries summed ([9]);\n * HTT completion status ([0..7]) of the firmware-released ones (build-pong-ath11k.py edit 10) */\nunsigned nw_wifi_t970_tqm[10], nw_wifi_t970_htt[8];\nstatic void\nath11k_dp_tx_process_htt_tx_complete(struct ath11k_base *ab,\n'), ('\tswitch (wbm_status) {\n\tcase HAL_WBM_REL_HTT_TX_COMP_STATUS_OK:\n', '\tnw_wifi_t970_htt[wbm_status & 7]++;\n\tswitch (wbm_status) {\n\tcase HAL_WBM_REL_HTT_TX_COMP_STATUS_OK:\n'), ('\t\tath11k_dp_tx_status_parse(ab, tx_status, &ts);\n', '\t\tath11k_dp_tx_status_parse(ab, tx_status, &ts);\n\t\tif (ts.buf_rel_source == HAL_WBM_REL_SRC_MODULE_FW) {\n\t\t\tnw_wifi_t970_tqm[8]++;\n\t\t} else if (ts.buf_rel_source == HAL_WBM_REL_SRC_MODULE_TQM) {\n\t\t\tnw_wifi_t970_tqm[ts.status & 7]++;\n\t\t\tif (ts.try_cnt > 1)\n\t\t\t\tnw_wifi_t970_tqm[9] += ts.try_cnt - 1;\n\t\t}\n')])
+    # 11. The firmware's regulatory domain reaches the channels. nw_mac80211.c's regulatory_set_wiphy_regd() was a stub, so
+    #     every channel kept max_reg_power 0: ath11k's channel list (op_start) and each vdev start told the firmware a
+    #     0 dBm regulatory limit. At home (5765 MHz, -53 dBm) 97 % of the data frames went unacknowledged after 18 tries
+    #     while the low-rate handshake got through. The domain is applied as cfg80211 does (net/wireless/reg.c,
+    #     handle_channel): no rule over the channel's 20 MHz = disabled, otherwise the rule's EIRP, antenna gain and
+    #     NO_IR / DFS flags; ath11k's notifier then sends a later domain to the firmware again. The station logs the
+    #     joined channel's limits.
+    edit(out / 'nw_mac80211_pong.c', [
+        ('int regulatory_set_wiphy_regd(struct wiphy *w, struct ieee80211_regdomain *rd) { (void)w; (void)rd; return 0; }\n',
+         'char nw_wifi_t970_cc[3];   /* SM-T970: the domain last applied (edit 11) */\n'
+         'int regulatory_set_wiphy_regd(struct wiphy *w, struct ieee80211_regdomain *rd) {\n'
+         '  static int kept; int allowed = 0, total = 0;\n'
+         '  if (!w || !rd || !rd->n_reg_rules) return -EINVAL;\n'
+         '  for (int b = 0; b < NUM_NL80211_BANDS; b++) { struct ieee80211_supported_band *sb = w->bands[b]; if (!sb) continue;\n'
+         '    for (int i = 0; i < sb->n_channels; i++) { struct ieee80211_channel *c = &sb->channels[i]; const struct ieee80211_reg_rule *r = 0;\n'
+         '      if (!kept) { c->orig_flags = c->flags; c->orig_mpwr = c->max_power; }\n'
+         '      total++;\n'
+         '      for (unsigned j = 0; j < rd->n_reg_rules && !r; j++)\n'
+         '        if (rd->reg_rules[j].freq_range.start_freq_khz <= (c->center_freq - 10) * 1000u &&\n'
+         '            rd->reg_rules[j].freq_range.end_freq_khz >= (c->center_freq + 10) * 1000u) r = &rd->reg_rules[j];\n'
+         '      c->flags = c->orig_flags & ~(IEEE80211_CHAN_DISABLED | IEEE80211_CHAN_NO_IR | IEEE80211_CHAN_RADAR);\n'
+         '      if (!r) { c->flags |= IEEE80211_CHAN_DISABLED; continue; }\n'
+         '      if (r->flags & NL80211_RRF_NO_IR) c->flags |= IEEE80211_CHAN_NO_IR;\n'
+         '      if (r->flags & NL80211_RRF_DFS) c->flags |= IEEE80211_CHAN_RADAR;\n'
+         '      c->max_reg_power = r->power_rule.max_eirp / 100; c->max_antenna_gain = r->power_rule.max_antenna_gain / 100;\n'
+         '      c->max_power = c->orig_mpwr && c->orig_mpwr < c->max_reg_power ? c->orig_mpwr : c->max_reg_power;\n'
+         '      allowed++; } }\n'
+         '  kept = 1; nw_wifi_t970_cc[0] = rd->alpha2[0]; nw_wifi_t970_cc[1] = rd->alpha2[1];\n'
+         '  lx_log(6, "wifi: regulatory domain %c%c, %u rules, %d of %d channels allowed", rd->alpha2[0], rd->alpha2[1],\n'
+         '         (unsigned)rd->n_reg_rules, allowed, total);\n'
+         '  if (w->reg_notifier) { struct regulatory_request rq = { .initiator = NL80211_REGDOM_SET_BY_DRIVER }; w->reg_notifier(w, &rq); }\n'
+         '  return 0; }\n'),
+    ])
+    edit(out / 'nw_sta_pong.c', [
+        ('  send_auth(); lx_queue_delayed(&g_timer, 100); }\n',
+         '  { extern char nw_wifi_t970_cc[3]; struct ieee80211_channel *t970c = chan_for(C.ap.freq);\n'
+         '    if (t970c) lx_log(6, "wifi: channel limits: regulatory %d dBm, antenna %d dBi, domain %s, flags %x",\n'
+         '                      t970c->max_reg_power, t970c->max_antenna_gain, nw_wifi_t970_cc[0] ? nw_wifi_t970_cc : "none",\n'
+         '                      (unsigned)t970c->flags); }\n'
+         '  send_auth(); lx_queue_delayed(&g_timer, 100); }\n'),
+    ])
+    # 12. (11-16) The address the station uses: QCA6390 without a programmed address gives a new 00:03:7f:xx:xx:xx on every
+    #     start, so networks saw a new device each boot. The board (bsd/dev/pong_wifi_tools.c) keeps one locally
+    #     administered address on the Data volume and sets nw_wifi_t970_mac before the start; zero keeps the firmware's.
+    #     nw_wifi_t970_noba declines the access point's Block Ack requests (status 37, edit 7's behaviour) for a test:
+    #     on wi_gen_5G_56 the link came up, multicast arrived and no unicast (no DHCP offer) after one accepted session.
+    edit(out / 'nw_sta_pong.c', [
+        ('static void teardown(int notify_lost, int reason);\n',
+         'static void teardown(int notify_lost, int reason);\n'
+         'uint8_t nw_wifi_t970_mac[6];           /* the board\'s station address; zero = the firmware\'s */\n'
+         'volatile int nw_wifi_t970_noba;        /* nonzero: decline Block Ack */\n'),
+        ('  memcpy(g_vif->addr, hw->wiphy->perm_addr, 6); g_vif->addr_valid = true; memcpy(g_vif->bss_conf.addr, hw->wiphy->perm_addr, 6);',
+         '  { static const u8 t970z[6]; memcpy(g_vif->addr, memcmp(nw_wifi_t970_mac, t970z, 6) ? nw_wifi_t970_mac : hw->wiphy->perm_addr, 6); }\n'
+         '  g_vif->addr_valid = true; memcpy(g_vif->bss_conf.addr, g_vif->addr, 6);'),
+        ('    if (p.tid < IEEE80211_FIRST_TSPEC_TSID && C.sta->deflink.ht_cap.ht_supported) {\n',
+         '    if (!nw_wifi_t970_noba && p.tid < IEEE80211_FIRST_TSPEC_TSID && C.sta->deflink.ht_cap.ht_supported) {\n'),
+    ])
+    # 13. (11-16) Receive losses inside ath11k, counted only (no behaviour change). The link came up, multicast arrived by
+    #     thousands and unicast almost never ("this station" 0-7), so no DHCP offer. Counted in dp_rx.c: REO exception ring
+    #     entries by REO error code (nw_wifi_t970_reo_exc, all dropped except single-MSDU fragments); WBM release ring errors
+    #     by source (REO / RXDMA) and code (nw_wifi_t970_wbm_err); nw_wifi_t970_rxp = [0] REO destination entries, [1] of
+    #     them dropped for the push reason, [2] unknown buffer, [3]/[4] MSDUs dropped by ath11k_dp_rx_process_msdu (-EIO /
+    #     other), [5]/[6] unicast / multicast MPDUs reaching ath11k_dp_rx_h_mpdu (first MSDU, attention bit), unicast ones
+    #     with [7] FCS, [8] TKIP MIC, [9] other error bits (their OR in nw_wifi_t970_rx_errbits), [10] not decrypted with a
+    #     cipher set, [11] no peer; [12] WBM entries without an error push reason (dropped), WBM errors [13] dropped, [14]
+    #     of them unicast, [15] passed on. nw_wifi_t970_rx_stats(b, n, 3|4) gives the two lines; until the board asks for
+    #     them, line 2's call logs them itself (just before the "tx tqm" line).
+    edit(gen / 'dp_rx.c', [
+        ('static void ath11k_dp_rx_h_mpdu(struct ath11k *ar,\n',
+         '/* SM-T970: receive losses by reason (build-pong-ath11k.py edit 13) */\n'
+         'unsigned nw_wifi_t970_reo_exc[16], nw_wifi_t970_wbm_err[2][16], nw_wifi_t970_rxp[16], nw_wifi_t970_rx_errbits;\n'
+         'static void ath11k_dp_rx_h_mpdu(struct ath11k *ar,\n'),
+        ('\tif (enctype != HAL_ENCRYPT_TYPE_OPEN && !err_bitmap)\n\t\tis_decrypted = ath11k_dp_rx_h_attn_is_decrypted(rx_attention);\n',
+         '\tif (enctype != HAL_ENCRYPT_TYPE_OPEN && !err_bitmap)\n\t\tis_decrypted = ath11k_dp_rx_h_attn_is_decrypted(rx_attention);\n'
+         '\tif (rxcb->is_first_msdu) {\n'
+         '\t\tnw_wifi_t970_rxp[rxcb->is_mcbc ? 6 : 5]++;\n'
+         '\t\tif (!rxcb->is_mcbc) {\n'
+         '\t\t\tnw_wifi_t970_rx_errbits |= err_bitmap;\n'
+         '\t\t\tif (err_bitmap & DP_RX_MPDU_ERR_FCS)\n\t\t\t\tnw_wifi_t970_rxp[7]++;\n'
+         '\t\t\tif (err_bitmap & DP_RX_MPDU_ERR_TKIP_MIC)\n\t\t\t\tnw_wifi_t970_rxp[8]++;\n'
+         '\t\t\tif (err_bitmap & ~(u32)(DP_RX_MPDU_ERR_FCS | DP_RX_MPDU_ERR_TKIP_MIC))\n\t\t\t\tnw_wifi_t970_rxp[9]++;\n'
+         '\t\t\tif (enctype != HAL_ENCRYPT_TYPE_OPEN && !err_bitmap && !is_decrypted)\n\t\t\t\tnw_wifi_t970_rxp[10]++;\n'
+         '\t\t\tif (!peer)\n\t\t\t\tnw_wifi_t970_rxp[11]++;\n'
+         '\t\t}\n'
+         '\t}\n'),
+        ('\t\tnum_buffs_reaped[mac_id]++;\n\n\t\tpush_reason = FIELD_GET(HAL_REO_DEST_RING_INFO0_PUSH_REASON,\n',
+         '\t\tnum_buffs_reaped[mac_id]++;\n\t\tnw_wifi_t970_rxp[0]++;\n\n\t\tpush_reason = FIELD_GET(HAL_REO_DEST_RING_INFO0_PUSH_REASON,\n'),
+        ('\t\t\tab->soc_stats.hal_reo_error[ring_id]++;\n',
+         '\t\t\tab->soc_stats.hal_reo_error[ring_id]++;\n\t\t\tnw_wifi_t970_rxp[1]++;\n'),
+        ('\t\t\tath11k_warn(ab, "frame rx with invalid buf_id %d\\n",\n\t\t\t\t    buf_id);\n',
+         '\t\t\tath11k_warn(ab, "frame rx with invalid buf_id %d\\n",\n\t\t\t\t    buf_id);\n\t\t\tnw_wifi_t970_rxp[2]++;\n'),
+        ('\t\t\t\t   "Unable to process msdu %d", ret);\n',
+         '\t\t\t\t   "Unable to process msdu %d", ret);\n\t\t\tnw_wifi_t970_rxp[ret == -EIO ? 3 : 4]++;\n'),
+        ('\t\tab->soc_stats.err_ring_pkts++;\n',
+         '\t\tab->soc_stats.err_ring_pkts++;\n'
+         '\t\t{ u32 t970e = FIELD_GET(HAL_REO_DEST_RING_INFO0_ERROR_CODE, reo_desc->info0);\n'
+         '\t\t  nw_wifi_t970_reo_exc[t970e < 15 ? t970e : 15]++; }\n'),
+        ('\tar->ab->soc_stats.reo_error[rxcb->err_code]++;\n',
+         '\tar->ab->soc_stats.reo_error[rxcb->err_code]++;\n'
+         '\tnw_wifi_t970_wbm_err[0][rxcb->err_code < 15 ? rxcb->err_code : 15]++;\n'),
+        ('\tar->ab->soc_stats.rxdma_error[rxcb->err_code]++;\n',
+         '\tar->ab->soc_stats.rxdma_error[rxcb->err_code]++;\n'
+         '\tnw_wifi_t970_wbm_err[1][rxcb->err_code < 15 ? rxcb->err_code : 15]++;\n'),
+        ('\tif (drop) {\n\t\tdev_kfree_skb_any(msdu);\n\t\treturn;\n\t}\n\n\tath11k_dp_rx_deliver_msdu(ar, napi, msdu, &rxs);\n',
+         '\tif (drop) {\n'
+         '\t\tnw_wifi_t970_rxp[13]++;\n'
+         '\t\tif (!ath11k_dp_rx_h_attn_is_mcbc(ar->ab, rxcb->rx_desc))\n'   # get_attention returns void * in 7.0
+         '\t\t\tnw_wifi_t970_rxp[14]++;\n'
+         '\t\tdev_kfree_skb_any(msdu);\n\t\treturn;\n\t}\n'
+         '\tnw_wifi_t970_rxp[15]++;\n\n\tath11k_dp_rx_deliver_msdu(ar, napi, msdu, &rxs);\n'),
+        ('\t\tif (err_info.push_reason !=\n\t\t    HAL_REO_DEST_RING_PUSH_REASON_ERR_DETECTED) {\n\t\t\tdev_kfree_skb_any(msdu);\n',
+         '\t\tif (err_info.push_reason !=\n\t\t    HAL_REO_DEST_RING_PUSH_REASON_ERR_DETECTED) {\n\t\t\tnw_wifi_t970_rxp[12]++;\n'
+         '\t\t\tdev_kfree_skb_any(msdu);\n'),
+    ])
+    edit(out / 'nw_sta_pong.c', [
+        ('void nw_wifi_t970_rx_stats(char *b, int n, int which) {\n',
+         'extern unsigned nw_wifi_t970_reo_exc[16], nw_wifi_t970_wbm_err[2][16], nw_wifi_t970_rxp[16], nw_wifi_t970_rx_errbits;   /* dp_rx.c, edit 13 */\n'
+         'static int t970_rxerr_polled;   /* the board asks for lines 3 and 4 itself: line 2 no longer logs them */\n'
+         'static int t970_codes(char *b, int n, int k, const char *name, const unsigned *c) {   /* nonzero ones as code:count */\n'
+         '  if (k < n) k += snprintf(b + k, n - k, " %s", name);\n'
+         '  for (int i = 0; i < 16 && k < n; i++) if (c[i]) k += snprintf(b + k, n - k, " %d:%u", i, c[i]);\n'
+         '  return k; }\n'
+         'static void t970_rx_err_line(char *b, int n, int which) {\n'
+         '  const unsigned *p = nw_wifi_t970_rxp;\n'
+         '  if (which == 3) { int k = snprintf(b, n, "rx err"); k = t970_codes(b, n, k, "reo-exc", nw_wifi_t970_reo_exc);\n'
+         '    k = t970_codes(b, n, k, "wbm-reo", nw_wifi_t970_wbm_err[0]); t970_codes(b, n, k, "wbm-rxdma", nw_wifi_t970_wbm_err[1]); }\n'
+         '  else snprintf(b, n, "rx mpdu uc %u mc %u; uc fcs %u mic %u oth %u bits %x undec %u nopeer %u; reo %u push %u badbuf %u msdu %u/%u; "\n'
+         '    "wbm noerr %u drop %u uc %u pass %u", p[5], p[6], p[7], p[8], p[9], nw_wifi_t970_rx_errbits, p[10], p[11], p[0], p[1], p[2],\n'
+         '    p[3], p[4], p[12], p[13], p[14], p[15]); }\n'
+         'void nw_wifi_t970_rx_stats(char *b, int n, int which) {\n'),
+        ('    nw_wifi_t970_htt[2], nw_wifi_t970_htt[3], nw_wifi_t970_htt[4]);\n  else snprintf(b, n, "tx ack/nack/free small',
+         '    nw_wifi_t970_htt[2], nw_wifi_t970_htt[3], nw_wifi_t970_htt[4]);\n'
+         '  if (which == 2 && !t970_rxerr_polled) { static char t[256];\n'
+         '    t970_rx_err_line(t, sizeof t, 3); lx_log(6, "%s", t); t970_rx_err_line(t, sizeof t, 4); lx_log(6, "%s", t); }\n'
+         '  if (which == 3 || which == 4) { t970_rxerr_polled = 1; t970_rx_err_line(b, n, which); }\n'
+         '  else if (which == 1) snprintf(b, n, "tx ack/nack/free small'),
+    ])
+    # 14. (11-16) Broadcast tests, boot arguments read when the station starts, both off by default. No frame addressed to
+    #     ff:ff:ff:ff:ff:ff ever reached en0 in any log (edit 13: ath11k's mc count equals en0's multicast, broadcast 0), and
+    #     the networks that worked sent their DHCP offers unicast; today's networks give no offer at all. pong_wifi_rxnwifi=1
+    #     has the hardware hand over 802.11 frames (native wifi, ath11k's default) instead of Ethernet ones; nw_sta_rx's
+    #     802.11 path takes them. pong_wifi_dhcpb=1 makes en0 set the BOOTP broadcast bit (build-t970-ath11k-link.py), so
+    #     the server answers by broadcast: a test of broadcast reception on a network that otherwise unicasts.
+    edit(out / 'nw_sta_pong.c', [
+        ('volatile int nw_wifi_t970_noba;        /* nonzero: decline Block Ack */\n',
+         'volatile int nw_wifi_t970_noba;        /* nonzero: decline Block Ack */\n'
+         'extern int PE_parse_boot_argn(const char *, void *, int);\n'
+         '/* 11-16 device result: with the Ethernet RX decap offload no broadcast frame ever reached the host (DHCP offers sent\n'
+         ' * by broadcast were lost; it only worked where the server unicast them); with native wifi frames broadcast arrives\n'
+         ' * and DHCP completes (half84w: broadcast 237, dhcp in 26, 192.168.1.3). So native wifi is the default now;\n'
+         ' * pong_wifi_rxnwifi=0 brings the Ethernet decap back. */\n'
+         'unsigned nw_wifi_t970_rxnwifi = 1, nw_wifi_t970_dhcpb;   /* boot arguments pong_wifi_rxnwifi, pong_wifi_dhcpb (edit 14) */\n'),
+        ('  g_vif->offload_flags = IEEE80211_OFFLOAD_ENCAP_ENABLED | IEEE80211_OFFLOAD_DECAP_ENABLED;',
+         '  PE_parse_boot_argn("pong_wifi_rxnwifi", &nw_wifi_t970_rxnwifi, sizeof nw_wifi_t970_rxnwifi);\n'
+         '  PE_parse_boot_argn("pong_wifi_dhcpb", &nw_wifi_t970_dhcpb, sizeof nw_wifi_t970_dhcpb);\n'
+         '  lx_log(6, "wifi: rx decap %s, dhcp broadcast bit %s", nw_wifi_t970_rxnwifi ? "native wifi" : "ethernet", nw_wifi_t970_dhcpb ? "set" : "left");\n'
+         '  g_vif->offload_flags = IEEE80211_OFFLOAD_ENCAP_ENABLED | (nw_wifi_t970_rxnwifi ? 0 : IEEE80211_OFFLOAD_DECAP_ENABLED);'),
+    ])
+    # 15. (11-17) A join that never ends. 11-16 a switch from one network to another (wi_gen_2.4G_46 -> wi_gen_5G_56) failed
+    #     with err -5 (NW_RES_UNSUPPORTED: the 5 GHz network's security, e.g. WPA3 or management frame protection required,
+    #     is outside rsn_check), and the next join then stayed in NW_STA_AUTH ("sta 3") for good: no "authentication sent
+    #     again", no timeout, en0 without an address until the tablet restarted. The retries and the give-up live in
+    #     timer_fn, so that timer was not running. nw_sta_run() runs on every step: a join still short of NW_STA_UP 15 s after
+    #     it started ends as a timeout there, whatever happened to the timer, and the log says whether the timer was armed.
+    edit(out / 'nw_sta_pong.c', [
+        ('    if (C.state == NW_STA_UP || C.state >= NW_STA_AUTH) send_queued(); } }',
+         '    if (C.state >= NW_STA_AUTH && C.state < NW_STA_UP && lx_now_ms() - C.started >= 15000) {   /* edit 15 */\n'
+         '      lx_log(4, "wifi: join still in state %d after 15 s (step timer armed %d, tries %d): giving up", C.state, g_timer.armed, C.tries);\n'
+         '      connect_done(NW_RES_TIMEOUT); }\n'
+         '    if (C.state == NW_STA_UP || C.state >= NW_STA_AUTH) send_queued(); } }'),
+    ])
+    # 16. (11-17) Station power save. The station never set any: the radio stayed awake for every beacon and frame while
+    #     connected, a fixed 100-300 mW estimated in work/gap_audit/POWER_ANALYSIS.md, mostly while the tablet is locked.
+    #     ath11k turns it on per vdev from vif->cfg.ps (ath11k_mac_op_bss_info_changed, BSS_CHANGED_PS ->
+    #     ath11k_mac_vif_setup_ps: WMI_STA_PS_PARAM_INACTIVITY_TIME = hw->conf.dynamic_ps_timeout, then
+    #     WMI_STA_PS_MODE_ENABLED; QCA6390 has supports_sta_ps). The firmware then sleeps between DTIM beacons and wakes for
+    #     the access point's TIM or for any frame we send (vdev create set TX_WAKE_THRESHOLD_ALWAYS, RX_WAKE_POLICY_WAKE),
+    #     going back to sleep after the inactivity time. Boot argument pong_wifi_ps: 0 never (the default until a device
+    #     measurement), 1 while the window server has the panel off (pong_panel_power_last() == 0, the lock screen; checked
+    #     every 100 ms by the connected step timer, so the screen coming on wakes the radio within 0.1 s), 2 always while
+    #     connected. pong_wifi_ps_ms is the inactivity time (default 100 ms, mac80211's own). A disconnect turns it off
+    #     first, so the next join starts awake. Each change is logged ("wifi: power save on/off"); wifistat's tx part shows
+    #     the state and the counts (scripts/build-t970-ath11k-link.py).
+    edit(out / 'nw_sta_pong.c', [
+        ("/* ---- the connection's life ---- */\nstatic void connect_done(int res) {\n",
+         "/* ---- station power save (build-pong-ath11k.py edit 16) ---- */\n"
+         'extern int pong_panel_power_last(void);   /* bsd/dev/pong_backlight_t970.c: -1 none seen yet, 0 off, 1 on */\n'
+         'unsigned nw_wifi_t970_ps_mode, nw_wifi_t970_ps_ms = 100;   /* boot arguments pong_wifi_ps, pong_wifi_ps_ms */\n'
+         'unsigned nw_wifi_t970_ps[3];   /* on now, times turned on, times turned off */\n'
+         'static void t970_ps_set(int on, const char *why) {\n'
+         '  if (!g_hw || !g_vif || !g_vif->cfg.ps == !on) return;\n'
+         '  g_vif->cfg.ps = on != 0; g_hw->conf.dynamic_ps_timeout = (int)nw_wifi_t970_ps_ms;\n'
+         '  g_ops->vif_cfg_changed(g_hw, g_vif, BSS_CHANGED_PS);\n'
+         '  nw_wifi_t970_ps[0] = on != 0; nw_wifi_t970_ps[on ? 1 : 2]++;\n'
+         '  lx_log(6, "wifi: power save %s (%s; inactivity %u ms; on %u off %u)", on ? "on" : "off", why, nw_wifi_t970_ps_ms,\n'
+         '         nw_wifi_t970_ps[1], nw_wifi_t970_ps[2]); }\n'
+         'static void t970_ps_step(void) {\n'
+         '  int dark = pong_panel_power_last() == 0;\n'
+         '  t970_ps_set(nw_wifi_t970_ps_mode >= 2 || (nw_wifi_t970_ps_mode == 1 && dark),\n'
+         '              nw_wifi_t970_ps_mode >= 2 ? "always" : dark ? "screen off" : "screen on"); }\n'
+         "/* ---- the connection's life ---- */\nstatic void connect_done(int res) {\n"),
+        ('  case NW_STA_UP: heartbeat(now); beacon_miss_check(now); break;\n',
+         '  case NW_STA_UP: heartbeat(now); beacon_miss_check(now); t970_ps_step(); break;\n'),
+        ('    if (g_vif->cfg.assoc) { g_vif->cfg.assoc = false;',
+         '    t970_ps_set(0, "disconnect");\n    if (g_vif->cfg.assoc) { g_vif->cfg.assoc = false;'),
+        ('  PE_parse_boot_argn("pong_wifi_dhcpb", &nw_wifi_t970_dhcpb, sizeof nw_wifi_t970_dhcpb);\n',
+         '  PE_parse_boot_argn("pong_wifi_dhcpb", &nw_wifi_t970_dhcpb, sizeof nw_wifi_t970_dhcpb);\n'
+         '  PE_parse_boot_argn("pong_wifi_ps", &nw_wifi_t970_ps_mode, sizeof nw_wifi_t970_ps_mode);\n'
+         '  PE_parse_boot_argn("pong_wifi_ps_ms", &nw_wifi_t970_ps_ms, sizeof nw_wifi_t970_ps_ms);\n'
+         '  if (!nw_wifi_t970_ps_ms || nw_wifi_t970_ps_ms > 10000) nw_wifi_t970_ps_ms = 100;\n'
+         '  lx_log(6, "wifi: power save mode %u (0 never, 1 screen off, 2 always), inactivity %u ms", nw_wifi_t970_ps_mode, nw_wifi_t970_ps_ms);\n'),
+    ])
+    # 17. WPA3-Personal (SAE Group 19 H&P + H2E), WPA2/WPA3 mixed mode, PSK-SHA256, and PMF (802.11w / BIP-CMAC-128)
+    edit(out / 'nw_sta_pong.c', [
+        ('#include "nw_sta.h"\n',
+         '#include "nw_sta.h"\n#include "T970WifiWpa3.h"   /* edit 17 */\n'),
+        ('#define IE_MAX 384\n',
+         '#define IE_MAX 768   /* edit 17: retain trailing RSNXE on large beacons */\n'),
+        ('  struct ieee80211_key_conf *ptk_key, *gtk_key; u16 seq; u8 gtk_id;\n'
+         '  u64 started; u64 last_tx; int tries; int rsn_ok; u16 aid;\n'
+         '  /* message 4 waits for its acknowledgement before the keys go in: the access point may repeat message 3 in the clear meanwhile */\n'
+         '  u8 gtk[32]; int gtk_len, gtk_idx; int m4_done; u64 m4_at; u64 hb_at; unsigned hb_frames, hb_beacons, hb_quiet; u64 bmiss_at; unsigned bmiss_frames;\n'
+         '} C;\n',
+         '  struct ieee80211_key_conf *ptk_key, *gtk_key, *igtk_key; u16 seq; u8 gtk_id;\n'
+         '  u64 started; u64 last_tx; int tries; int rsn_ok; u16 aid;\n'
+         '  /* message 4 waits for its acknowledgement before the keys go in: the access point may repeat message 3 in the clear meanwhile */\n'
+         '  u8 gtk[32]; int gtk_len, gtk_idx; int m4_done; u64 m4_at; u64 hb_at; unsigned hb_frames, hb_beacons, hb_quiet; u64 bmiss_at; unsigned bmiss_frames;\n'
+         '  pw3_rsn_info rsn; pw3_sae_ctx sae; u8 pass[65]; int pass_len; u8 pmkid[16]; u8 have_pmkid;\n'
+         '  u8 sae_stage, sae_token[64], sae_token_len; u8 igtk[16], igtk_pn[6]; u16 igtk_id; u8 have_igtk;\n'
+         '} C;\n'),
+        ('static int rsn_check(const u8 *e) {\n'
+         '  if (!e) return -1;\n'
+         '  const u8 *p = e + 2, *end = e + 2 + e[1]; if (end - p < 2) return -1; p += 2;                         /* version */\n'
+         '  if (end - p < 4) return -1; p += 4;                                                                /* group cipher: any is accepted for receive */\n'
+         '  if (end - p < 2) return -1; unsigned n = p[0] | p[1] << 8; p += 2; int ccmp = 0;\n'
+         '  for (unsigned i = 0; i < n; i++) { if (end - p < 4) return -1; if (!memcmp(p, OUI_RSN, 3) && p[3] == 4) ccmp = 1; p += 4; }\n'
+         '  if (end - p < 2) return -1; n = p[0] | p[1] << 8; p += 2; int psk = 0;\n'
+         '  for (unsigned i = 0; i < n; i++) { if (end - p < 4) return -1; if (!memcmp(p, OUI_RSN, 3) && p[3] == 2) psk = 1; p += 4; }\n'
+         '  u16 caps = end - p >= 2 ? (u16)(p[0] | p[1] << 8) : 0;\n'
+         '  if (!ccmp || !psk) return -2;\n'
+         '  if (caps & 0x0040) return -2;                                                                      /* management frame protection required */\n'
+         '  return 0; }\n',
+         'static int rsn_check(const u8 *e) {\n'
+         '  if (!e) return -1;\n'
+         '  return pw3_parse_rsn_ap(C.ap.ie, C.ap.ie_len, &C.rsn); }\n'),
+        ('static void send_auth(void) {\n'
+         '  struct sk_buff *skb = new_frame(8); if (!skb) return;\n'
+         '  mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_AUTH);\n'
+         '  u8 *b = skb_put_zero(skb, 6); b[0] = 0; b[1] = 0; b[2] = 1; b[3] = 0; b[4] = 0; b[5] = 0;      /* open system, sequence 1, status 0 */\n'
+         '  tx_frame(skb); }\n',
+         'static void make_nonce(u8 *out);\n'
+         'static void send_sae_commit(void) {\n'
+         '  struct sk_buff *skb = new_frame(200); if (!skb) return;\n'
+         '  mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_AUTH);\n'
+         '  u8 *b = skb_put(skb, 180);\n'
+         '  size_t blen = pw3_build_sae_commit(&C.sae, C.sae_token, C.sae_token_len, b, 180);\n'
+         '  if (!blen) { lx_free(skb); return; }\n'
+         '  skb->len -= (unsigned)(180u - blen);\n'
+         '  tx_frame(skb); }\n'
+         'static void send_sae_confirm(void) {\n'
+         '  struct sk_buff *skb = new_frame(64); if (!skb) return;\n'
+         '  mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_AUTH);\n'
+         '  u8 *b = skb_put(skb, 40);\n'
+         '  size_t blen = pw3_build_sae_confirm(&C.sae, b, 40);\n'
+         '  if (!blen) { lx_free(skb); return; }\n'
+         '  tx_frame(skb); }\n'
+         'static int start_sae(int h2e) {\n'
+         '  int rc = h2e ? pw3_sae_derive_pwe_h2e(&C.sae, C.ssid, C.ssid_len, g_vif->addr, C.ap.bssid, C.pass, (size_t)C.pass_len)\n'
+         '               : pw3_sae_derive_pwe_hnp(&C.sae, g_vif->addr, C.ap.bssid, C.pass, (size_t)C.pass_len);\n'
+         '  if (rc) { lx_log(3, "wifi: SAE PWE derivation failed (%s)", h2e ? "H2E" : "H&P"); connect_done(NW_RES_FAILED); return -1; }\n'
+         '  u8 rnd[64]; int ok = -1;\n'
+         '  for (int i = 0; i < 8 && ok != 0; i++) { make_nonce(rnd); make_nonce(rnd + 32); ok = pw3_sae_commit_begin(&C.sae, rnd); }\n'
+         '  pw3_ct_zero(rnd, sizeof rnd);\n'
+         '  if (ok) { connect_done(NW_RES_FAILED); return -1; }\n'
+         '  C.sae_stage = 1; C.sae_token_len = 0;\n'
+         '  lx_log(6, "wifi: SAE commit (%s)", h2e ? "H2E" : "H&P");\n'
+         '  send_sae_commit(); return 0; }\n'
+         'static void send_auth(void) {\n'
+         '  if (C.secure && C.rsn.akm == 8u) {\n'
+         '    if (C.sae_stage == 0u) start_sae(C.rsn.use_h2e);\n'
+         '    else if (C.sae_stage == 1u) send_sae_commit();\n'
+         '    else if (C.sae_stage == 2u) send_sae_confirm();\n'
+         '    return; }\n'
+         '  struct sk_buff *skb = new_frame(8); if (!skb) return;\n'
+         '  mgmt_header(skb, IEEE80211_FTYPE_MGMT | IEEE80211_STYPE_AUTH);\n'
+         '  u8 *b = skb_put_zero(skb, 6); b[0] = 0; b[1] = 0; b[2] = 1; b[3] = 0; b[4] = 0; b[5] = 0;\n'
+         '  tx_frame(skb); }\n'),
+        ('  if (C.secure) {   /* RSN: version 1, group CCMP, pairwise CCMP, key management PSK, no capabilities */\n'
+         '    static const u8 rsn[] = { WLAN_EID_RSN, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };\n'
+         '    skb_put_data(skb, rsn, sizeof rsn); }\n',
+         '  if (C.secure) {\n'
+         '    u8 ie[80]; size_t rlen = pw3_build_assoc_rsn(&C.rsn, C.have_pmkid ? C.pmkid : 0, ie, sizeof ie);\n'
+         '    if (rlen) skb_put_data(skb, ie, rlen);\n'
+         '    size_t xlen = pw3_build_assoc_rsnxe(&C.rsn, ie, sizeof ie);\n'
+         '    if (xlen) skb_put_data(skb, ie, xlen); }\n'),
+        ('  sta->wme = true;\n',
+         '  sta->wme = true; sta->mfp = (C.secure && C.rsn.use_mfp) ? true : false;\n'),
+        ('static void derive_ptk(void) {\n'
+         '  u8 data[76]; const u8 *a = g_vif->addr, *b = C.ap.bssid;\n'
+         '  const u8 *lo = memcmp(a, b, 6) < 0 ? a : b, *hi = lo == a ? b : a; memcpy(data, lo, 6); memcpy(data + 6, hi, 6);\n'
+         '  const u8 *nl = memcmp(C.anonce, C.snonce, 32) < 0 ? C.anonce : C.snonce, *nh = nl == C.anonce ? C.snonce : C.anonce; memcpy(data + 12, nl, 32); memcpy(data + 44, nh, 32);\n'
+         '  nw_prf(C.pmk, 32, "Pairwise key expansion", data, 76, C.ptk, 384); C.ptk_ready = 1; }\n',
+         'static u8 eapol_out_ver(void) { return C.rsn.akm == 8u ? 0u : (C.rsn.akm == 6u ? 3u : 2u); }\n'
+         'static int eapol_ver_ok(u8 v) {\n'
+         '  if (C.rsn.akm == 8u) return v == 0u || v == 3u;\n'
+         '  if (C.rsn.akm == 6u) return v == 3u;\n'
+         '  return v == 2u; }\n'
+         'static void eapol_mic(const u8 *buf, unsigned total, u8 out[16]) {\n'
+         '  if (C.rsn.akm >= 6u) { pw3_aes128_cmac(C.ptk, buf, total, out); }\n'
+         '  else { u8 h[20]; nw_hmac_sha1(C.ptk, 16, buf, total, h); memcpy(out, h, 16); } }\n'
+         'static void derive_ptk(void) {\n'
+         '  u8 data[76]; const u8 *a = g_vif->addr, *b = C.ap.bssid;\n'
+         '  if (C.rsn.akm >= 6u) { pw3_derive_ptk_sha256(C.pmk, b, a, C.anonce, C.snonce, C.ptk); C.ptk_ready = 1; return; }\n'
+         '  const u8 *lo = memcmp(a, b, 6) < 0 ? a : b, *hi = lo == a ? b : a; memcpy(data, lo, 6); memcpy(data + 6, hi, 6);\n'
+         '  const u8 *nl = memcmp(C.anonce, C.snonce, 32) < 0 ? C.anonce : C.snonce, *nh = nl == C.anonce ? C.snonce : C.anonce; memcpy(data + 12, nl, 32); memcpy(data + 44, nh, 32);\n'
+         '  nw_prf(C.pmk, 32, "Pairwise key expansion", data, 76, C.ptk, 384); C.ptk_ready = 1; }\n'),
+        ('static void sign(struct eapol_key *k, unsigned total) {\n'
+         '  u8 h[20]; memset(k->mic, 0, 16); nw_hmac_sha1(C.ptk, 16, (const u8 *)k, total, h); memcpy(k->mic, h, 16); }\n',
+         'static void sign(struct eapol_key *k, unsigned total) {\n'
+         '  memset(k->mic, 0, 16); eapol_mic((const u8 *)k, total, k->mic); }\n'),
+        ('  int r = g_ops->set_key(g_hw, SET_KEY, g_vif, pairwise ? C.sta : 0, kc);\n'
+         '  if (r) { lx_log(3, "wifi: installing the %s key failed: %d", pairwise ? "pairwise" : "group", r); lx_free(kc); return r; }\n',
+         '  int r = g_ops->set_key(g_hw, SET_KEY, g_vif, pairwise ? C.sta : 0, kc);\n'
+         '  if (r < 0) { lx_log(3, "wifi: installing the %s key failed: %d", pairwise ? "pairwise" : "group", r); lx_free(kc); return r; }\n'),
+        ('static void install_keys(void) {\n'
+         '  if (install_key(1, 0, C.ptk + 32, 16)) { connect_done(NW_RES_FAILED); return; }\n'
+         '  if (C.gtk_len && install_key(0, C.gtk_idx, C.gtk, 16)) { connect_done(NW_RES_FAILED); return; }\n'
+         '  C.hs_stage = 4; finish_authorized(); }\n',
+         'static int install_igtk(void) {\n'
+         '  if (!C.have_igtk) return 0;\n'
+         '  if (C.igtk_key) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, 0, C.igtk_key); lx_free(C.igtk_key); C.igtk_key = 0; }\n'
+         '  struct ieee80211_key_conf *kc = lx_alloc(sizeof *kc + 32, 1); if (!kc) return -ENOMEM;\n'
+         '  kc->cipher = WLAN_CIPHER_SUITE_AES_CMAC; kc->keyidx = (s8)C.igtk_id; kc->keylen = 16; kc->icv_len = 8; kc->iv_len = 0;\n'
+         '  kc->hw_key_idx = 0xff; kc->link_id = -1; kc->flags = 0; memcpy(kc->key, C.igtk, 16);\n'
+         '  int r = g_ops->set_key(g_hw, SET_KEY, g_vif, 0, kc);\n'
+         '  if (r < 0) { lx_log(3, "wifi: installing IGTK failed: %d", r); lx_free(kc); return r; }\n'
+         '  C.igtk_key = kc;\n'
+         '  lx_log(6, "wifi: PMF IGTK installed (keyid %u, %s)", C.igtk_id, r > 0 ? "sw-bip" : "hw");\n'
+         '  return 0; }\n'
+         'static void install_keys(void) {\n'
+         '  if (install_key(1, 0, C.ptk + 32, 16)) { connect_done(NW_RES_FAILED); return; }\n'
+         '  if (C.gtk_len && install_key(0, C.gtk_idx, C.gtk, 16)) { connect_done(NW_RES_FAILED); return; }\n'
+         '  if (C.rsn.use_mfp && C.have_igtk && install_igtk() < 0) { connect_done(NW_RES_FAILED); return; }\n'
+         '  C.hs_stage = 4; finish_authorized(); }\n'),
+        ('  if ((info & 7) != 2) { lx_log(4, "wifi: key descriptor version %u not handled", info & 7); return; }\n',
+         '  if (!eapol_ver_ok((u8)(info & 7u))) { lx_log(4, "wifi: key descriptor version %u not handled for akm %u", info & 7u, C.rsn.akm); return; }\n'),
+        ('    memcpy(C.anonce, k->nonce, 32); make_nonce(C.snonce); derive_ptk(); C.replay = be64(k->replay); C.have_replay = 1; C.hs_stage = 1;\n'
+         '    struct eapol_key *o = (void *)buf; memset(o, 0, sizeof *o + 22); o->ver = 2; o->type = 3; o->desc = 2;\n'
+         '    static const u8 rsn[] = { WLAN_EID_RSN, 20, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 4, 1, 0, 0x00, 0x0f, 0xac, 2, 0, 0 };\n'
+         '    unsigned body = sizeof *o - 4 + sizeof rsn; o->len[0] = body >> 8; o->len[1] = body; o->info[0] = 0x01; o->info[1] = 0x0a; o->keylen[0] = 0;\n'
+         '    memcpy(o->replay, k->replay, 8); memcpy(o->nonce, C.snonce, 32); o->datalen[0] = 0; o->datalen[1] = sizeof rsn; memcpy(o->data, rsn, sizeof rsn);\n'
+         '    sign(o, sizeof *o + sizeof rsn); send_eapol(o, sizeof *o + sizeof rsn); lx_log(6, "wifi: handshake message 2 sent"); return; }\n',
+         '    if (C.rsn.akm == 8u && C.have_pmkid && dlen > 0) { u8 m1_pmkid[16]; if (pw3_find_pmkid_kde(k->data, dlen, m1_pmkid) == 0 && pw3_ct_memcmp(m1_pmkid, C.pmkid, 16) != 0) lx_log(4, "wifi: M1 PMKID mismatch"); }\n'
+         '    memcpy(C.anonce, k->nonce, 32); make_nonce(C.snonce); derive_ptk(); C.replay = be64(k->replay); C.have_replay = 1; C.hs_stage = 1;\n'
+         '    u8 rsn[80]; size_t rlen = pw3_build_assoc_rsn(&C.rsn, C.have_pmkid ? C.pmkid : 0, rsn, sizeof rsn);\n'
+         '    if (!rlen || sizeof(struct eapol_key) + rlen > sizeof buf) return;\n'
+         '    struct eapol_key *o = (void *)buf; memset(o, 0, sizeof *o + rlen); o->ver = 2; o->type = 3; o->desc = 2;\n'
+         '    unsigned body = sizeof *o - 4 + (unsigned)rlen; o->len[0] = body >> 8; o->len[1] = body;\n'
+         '    o->info[0] = 0x01; o->info[1] = (u8)(0x08u | eapol_out_ver()); o->keylen[0] = 0;\n'
+         '    memcpy(o->replay, k->replay, 8); memcpy(o->nonce, C.snonce, 32); o->datalen[0] = rlen >> 8; o->datalen[1] = rlen; memcpy(o->data, rsn, rlen);\n'
+         '    sign(o, sizeof *o + (unsigned)rlen); send_eapol(o, sizeof *o + (unsigned)rlen); lx_log(6, "wifi: handshake message 2 sent"); return; }\n'),
+        ('  memcpy(buf, p, total); struct eapol_key *c = (void *)buf; u8 want[16], h[20]; memset(c->mic, 0, 16); nw_hmac_sha1(C.ptk, 16, buf, total, h); memcpy(want, h, 16);\n',
+         '  memcpy(buf, p, total); struct eapol_key *c = (void *)buf; u8 want[16]; memset(c->mic, 0, 16); eapol_mic(buf, total, want);\n'),
+        ('    o->info[0] = 0x03; o->info[1] = 0x0a; memcpy(o->replay, k->replay, 8); sign(o, sizeof *o);\n',
+         '    o->info[0] = 0x03; o->info[1] = (u8)(0x08u | eapol_out_ver()); memcpy(o->replay, k->replay, 8); sign(o, sizeof *o);\n'),
+        ('    C.gtk_len = gtk && gtklen >= 16 ? 16 : 0; C.gtk_idx = gtkid; if (C.gtk_len) memcpy(C.gtk, gtk, 16);\n'
+         '    C.hs_stage = 3; C.m4_done = 0; C.m4_at = lx_now_ms();\n',
+         '    C.gtk_len = gtk && gtklen >= 16 ? 16 : 0; C.gtk_idx = gtkid; if (C.gtk_len) memcpy(C.gtk, gtk, 16);\n'
+         '    if (C.rsn.use_mfp) { u16 igid = 0; u8 igpn[6], igtk_b[16]; if (pw3_find_igtk_kde(kd, pl, &igid, igpn, igtk_b) == 0) { C.igtk_id = igid; memcpy(C.igtk_pn, igpn, 6); memcpy(C.igtk, igtk_b, 16); C.have_igtk = 1; } }\n'
+         '    C.hs_stage = 3; C.m4_done = 0; C.m4_at = lx_now_ms();\n'),
+        ('  if (!pairwise && ack) {   /* group key update */\n'
+         '    lx_log(6, "wifi: group key update%s", gtk && gtklen >= 16 ? "" : " without a key");\n'
+         '    if (gtk && gtklen >= 16) install_key(0, gtkid, gtk, 16);\n'
+         '    struct eapol_key *o = (void *)buf; memset(o, 0, sizeof *o); o->ver = 2; o->type = 3; o->desc = 2; unsigned body = sizeof *o - 4; o->len[0] = body >> 8; o->len[1] = body;\n'
+         '    o->info[0] = 0x03; o->info[1] = 0x02; memcpy(o->replay, k->replay, 8); sign(o, sizeof *o); send_eapol(o, sizeof *o); } }\n',
+         '  if (!pairwise && ack) {   /* group key update */\n'
+         '    lx_log(6, "wifi: group key update%s", gtk && gtklen >= 16 ? "" : " without a key");\n'
+         '    if (gtk && gtklen >= 16) install_key(0, gtkid, gtk, 16);\n'
+         '    if (C.rsn.use_mfp) { u16 igid = 0; u8 igpn[6], igtk_b[16]; if (pw3_find_igtk_kde(kd, pl, &igid, igpn, igtk_b) == 0) { C.igtk_id = igid; memcpy(C.igtk_pn, igpn, 6); memcpy(C.igtk, igtk_b, 16); C.have_igtk = 1; install_igtk(); } }\n'
+         '    struct eapol_key *o = (void *)buf; memset(o, 0, sizeof *o); o->ver = 2; o->type = 3; o->desc = 2; unsigned body = sizeof *o - 4; o->len[0] = body >> 8; o->len[1] = body;\n'
+         '    o->info[0] = 0x03; o->info[1] = eapol_out_ver(); memcpy(o->replay, k->replay, 8); sign(o, sizeof *o); send_eapol(o, sizeof *o); } }\n'),
+        ('static void on_mgmt(struct sk_buff *skb) {\n'
+         '  struct ieee80211_mgmt *m = (void *)skb->data; u16 fc = le16_to_cpu(m->frame_control);\n'
+         '  if (memcmp(m->sa, C.ap.bssid, 6)) return;\n'
+         '  if (C.state == NW_STA_AUTH && ieee80211_is_auth(m->frame_control) && skb->len >= 30) {\n'
+         '    u16 status = le16_to_cpu(m->u.auth.status_code), seq = le16_to_cpu(m->u.auth.auth_transaction);\n'
+         '    if (seq != 2) return;\n'
+         '    if (status) { lx_log(4, "wifi: authentication refused: %u", status); connect_done(NW_RES_REJECTED); return; }\n'
+         '    if (set_sta_state(IEEE80211_STA_AUTH)) { connect_done(NW_RES_FAILED); return; }\n'
+         '    C.state = NW_STA_ASSOC; C.tries = 0; C.started = lx_now_ms(); send_assoc(); return; }\n',
+         'static void handle_sae_auth(const u8 *body, unsigned len) {\n'
+         '  pw3_sae_rx rx; if (pw3_parse_sae_auth(body, len, &rx) != 0) return;\n'
+         '  if (rx.seq == 1u) {\n'
+         '    if (rx.status == PW3_SAE_ANTI_CLOG_STATUS) {\n'
+         '      memcpy(C.sae_token, rx.token, rx.token_len); C.sae_token_len = rx.token_len;\n'
+         '      C.tries = 0; lx_log(6, "wifi: SAE anti-clogging token (%u B)", C.sae_token_len); send_sae_commit(); return; }\n'
+         '    if (rx.status == PW3_SAE_H2E_STATUS && !C.sae.use_h2e && !rx.has_scalar_elem) {\n'
+         '      C.rsn.use_h2e = 1u; C.tries = 0; start_sae(1); return; }\n'
+         '    if (rx.status != 0u && rx.status != PW3_SAE_H2E_STATUS) {\n'
+         '      lx_log(4, "wifi: SAE commit refused: %u", rx.status); connect_done(NW_RES_REJECTED); return; }\n'
+         '    if (!rx.has_scalar_elem) return;\n'
+         '    if (C.sae_stage == 2u) {\n'
+         '      if (!memcmp(rx.scalar, C.sae.peer_scalar, 32) && !memcmp(rx.elem, C.sae.peer_elem, 64)) send_sae_confirm();\n'
+         '      return; }\n'
+         '    if (C.sae_stage != 1u) return;\n'
+         '    int rc = pw3_sae_process_peer_commit(&C.sae, rx.scalar, rx.elem);\n'
+         '    if (rc) { lx_log(4, "wifi: SAE peer commit rejected (%d)", rc); connect_done(NW_RES_REJECTED); return; }\n'
+         '    C.sae_stage = 2u; C.tries = 0; send_sae_confirm(); return; }\n'
+         '  if (rx.seq == 2u) {\n'
+         '    if (rx.status != 0u) { lx_log(4, "wifi: SAE confirm refused: %u", rx.status); connect_done(NW_RES_BAD_KEY); return; }\n'
+         '    if (C.sae_stage != 2u || !rx.has_confirm) return;\n'
+         '    if (pw3_sae_verify_confirm(&C.sae, rx.send_confirm, rx.confirm) != 0) {\n'
+         '      lx_log(4, "wifi: SAE confirm mismatch (wrong passphrase?)"); connect_done(NW_RES_BAD_KEY); return; }\n'
+         '    memcpy(C.pmk, C.sae.pmk, 32); memcpy(C.pmkid, C.sae.pmkid, 16); C.have_pmkid = 1u;\n'
+         '    pw3_sae_wipe(&C.sae); C.sae_stage = 3u;\n'
+         '    if (set_sta_state(IEEE80211_STA_AUTH)) { connect_done(NW_RES_FAILED); return; }\n'
+         '    C.state = NW_STA_ASSOC; C.tries = 0; C.started = lx_now_ms(); send_assoc(); return; } }\n'
+         'static void on_mgmt(struct sk_buff *skb) {\n'
+         '  struct ieee80211_mgmt *m = (void *)skb->data; u16 fc = le16_to_cpu(m->frame_control);\n'
+         '  if (memcmp(m->sa, C.ap.bssid, 6)) return;\n'
+         '  if (C.state == NW_STA_AUTH && ieee80211_is_auth(m->frame_control) && skb->len >= 30) {\n'
+         '    if (C.secure && C.rsn.akm == 8u) { handle_sae_auth(skb->data + 24, skb->len - 24); return; }\n'
+         '    if (le16_to_cpu(m->u.auth.auth_alg) != 0u) return;\n'
+         '    u16 status = le16_to_cpu(m->u.auth.status_code), seq = le16_to_cpu(m->u.auth.auth_transaction);\n'
+         '    if (seq != 2) return;\n'
+         '    if (status) { lx_log(4, "wifi: authentication refused: %u", status); connect_done(NW_RES_REJECTED); return; }\n'
+         '    if (set_sta_state(IEEE80211_STA_AUTH)) { connect_done(NW_RES_FAILED); return; }\n'
+         '    C.state = NW_STA_ASSOC; C.tries = 0; C.started = lx_now_ms(); send_assoc(); return; }\n'),
+        ('  if ((ieee80211_is_deauth(m->frame_control) || ieee80211_is_disassoc(m->frame_control)) && C.state >= NW_STA_AUTH) {\n'
+         '    u16 reason = le16_to_cpu(m->u.deauth.reason_code); lx_log(4, "wifi: access point ended the connection: reason %u (%s)", reason, tx_reasons()); nw_wifi_htt_stats(8);\n'
+         '    if (C.state == NW_STA_UP) { teardown(1, reason); } else connect_done(NW_RES_REJECTED); }\n',
+         '  if ((ieee80211_is_deauth(m->frame_control) || ieee80211_is_disassoc(m->frame_control)) && C.state >= NW_STA_AUTH) {\n'
+         '    const char *kind = ieee80211_is_deauth(m->frame_control) ? "deauth" : "disassoc";\n'
+         '    struct ieee80211_rx_status *st = IEEE80211_SKB_RXCB(skb);\n'
+         '    u16 reason = 0;\n'
+         '    if (C.rsn.use_mfp && C.ptk_ready) {\n'
+         '      if (is_multicast_ether_addr(m->da)) {\n'
+         '        if (ieee80211_has_protected(m->frame_control) || !C.have_igtk ||\n'
+         '            pw3_bip_cmac128_verify(C.igtk, C.igtk_id, C.igtk_pn, skb->data, skb->len) != 0) {\n'
+         '          lx_log(4, "wifi: dropped unverified broadcast %s", kind); return; }\n'
+         '        if (skb->len < 26) return;\n'
+         '        reason = (u16)(skb->data[24] | (skb->data[25] << 8));\n'
+         '      } else {\n'
+         '        if (!ieee80211_has_protected(m->frame_control)) {\n'
+         '          lx_log(4, "wifi: dropped unprotected unicast %s", kind); return; }\n'
+         '        if (!(st->flag & RX_FLAG_DECRYPTED)) {\n'
+         '          lx_log(4, "wifi: dropped undecrypted protected %s", kind); return; }\n'
+         '        unsigned off = (st->flag & RX_FLAG_IV_STRIPPED) ? 24u : 32u;\n'
+         '        unsigned minl = (st->flag & RX_FLAG_IV_STRIPPED) ? 26u : 42u;\n'
+         '        if (skb->len < minl) return;\n'
+         '        reason = (u16)(skb->data[off] | (skb->data[off + 1] << 8));\n'
+         '      }\n'
+         '    } else {\n'
+         '      if (skb->len < 26) return;\n'
+         '      reason = (u16)(skb->data[24] | (skb->data[25] << 8));\n'
+         '    }\n'
+         '    lx_log(4, "wifi: access point ended the connection: %s reason %u (%s)", kind, reason, tx_reasons()); nw_wifi_htt_stats(8);\n'
+         '    if (C.state == NW_STA_UP) { teardown(1, reason); } else connect_done(NW_RES_REJECTED); }\n'),
+        ('  if (ieee80211_is_action(h->frame_control) && skb->len >= 26 && !memcmp(h->addr2, C.ap.bssid, 6)) {\n'
+         '    const u8 *a = skb->data + 24; nw_wifi_t970_rxd[0]++;\n'
+         '    if (a[0] == WLAN_CATEGORY_BACK) { nw_wifi_t970_rxd[1]++;\n'
+         '      if (a[1] == WLAN_ACTION_ADDBA_REQ) nw_wifi_t970_rxd[2]++;\n'
+         '      if (C.sta && C.state >= NW_STA_KEYS) t970_back(a, skb->len - 24); } }\n',
+         '  if (ieee80211_is_action(h->frame_control) && skb->len >= 26 && !memcmp(h->addr2, C.ap.bssid, 6)) {\n'
+         '    struct ieee80211_rx_status *ast = IEEE80211_SKB_RXCB(skb);\n'
+         '    unsigned aoff = 24u, atrim = 24u;\n'
+         '    if (ieee80211_has_protected(h->frame_control)) {\n'
+         '      if (!(ast->flag & RX_FLAG_DECRYPTED)) return;\n'
+         '      if (!(ast->flag & RX_FLAG_IV_STRIPPED)) { aoff = 32u; atrim = 40u; }\n'
+         '    }\n'
+         '    if (skb->len >= atrim + 2u) {\n'
+         '      const u8 *a = skb->data + aoff; nw_wifi_t970_rxd[0]++;\n'
+         '      if (a[0] == WLAN_CATEGORY_BACK) { nw_wifi_t970_rxd[1]++;\n'
+         '        if (a[1] == WLAN_ACTION_ADDBA_REQ) nw_wifi_t970_rxd[2]++;\n'
+         '        if (C.sta && C.state >= NW_STA_KEYS) t970_back(a, skb->len - atrim); } } }\n'),
+        ('    if (C.ptk_key) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, C.sta, C.ptk_key); lx_free(C.ptk_key); C.ptk_key = 0; }\n'
+         '    if (C.gtk_key) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, 0, C.gtk_key); lx_free(C.gtk_key); C.gtk_key = 0; }\n',
+         '    if (C.ptk_key) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, C.sta, C.ptk_key); lx_free(C.ptk_key); C.ptk_key = 0; }\n'
+         '    if (C.gtk_key) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, 0, C.gtk_key); lx_free(C.gtk_key); C.gtk_key = 0; }\n'
+         '    if (C.igtk_key) { g_ops->set_key(g_hw, DISABLE_KEY, g_vif, 0, C.igtk_key); lx_free(C.igtk_key); C.igtk_key = 0; }\n'),
+        ('  g_vif->bss_conf.bssid = g_no_bssid; C.ptk_ready = 0; C.hs_stage = 0; C.have_replay = 0; C.chanctx_up = 0;\n',
+         '  g_vif->bss_conf.bssid = g_no_bssid; C.ptk_ready = 0; C.hs_stage = 0; C.have_replay = 0; C.chanctx_up = 0;\n'
+         '  pw3_sae_wipe(&C.sae); pw3_ct_zero(C.pmk, sizeof C.pmk); pw3_ct_zero(C.ptk, sizeof C.ptk);\n'
+         '  pw3_ct_zero(C.pass, sizeof C.pass); pw3_ct_zero(C.igtk, sizeof C.igtk); pw3_ct_zero(C.pmkid, sizeof C.pmkid);\n'
+         '  C.pass_len = 0; C.have_pmkid = 0; C.have_igtk = 0; C.sae_stage = 0; C.sae_token_len = 0; memset(&C.rsn, 0, sizeof C.rsn);\n'),
+        ('  const u8 *rsn = find_rsn(C.ap.ie, C.ap.ie_len); C.secure = g_req.has_pass;\n'
+         '  if (C.secure) {\n'
+         '    if (rsn_check(rsn)) { lx_log(4, "wifi: network security not supported"); connect_done(NW_RES_UNSUPPORTED); return; }\n'
+         '    if (g_req.pass_len == 64) { for (int i = 0; i < 32; i++) { unsigned v; const char *s = g_req.pass + 2 * i; int hi = (s[0] <= \'9\' ? s[0] - \'0\' : (s[0] | 32) - \'a\' + 10), lo = (s[1] <= \'9\' ? s[1] - \'0\' : (s[1] | 32) - \'a\' + 10); v = hi << 4 | lo; C.pmk[i] = v; } }\n'
+         '    else nw_pbkdf2_sha1(g_req.pass, g_req.pass_len, C.ssid, C.ssid_len, 4096, C.pmk, 32);\n'
+         '  } else if (rsn) { lx_log(4, "wifi: network needs a passphrase"); connect_done(NW_RES_BAD_KEY); return; }\n',
+         '  const u8 *rsn = find_rsn(C.ap.ie, C.ap.ie_len); C.secure = g_req.has_pass;\n'
+         '  memset(&C.rsn, 0, sizeof C.rsn); C.have_pmkid = 0; C.have_igtk = 0; C.sae_stage = 0; C.sae_token_len = 0; pw3_sae_wipe(&C.sae);\n'
+         '  if (C.secure) {\n'
+         '    if (g_req.pass_len <= 0 || g_req.pass_len > 64) { connect_done(NW_RES_BAD_KEY); return; }\n'
+         '    if (rsn_check(rsn)) { lx_log(4, "wifi: network security not supported"); connect_done(NW_RES_UNSUPPORTED); return; }\n'
+         '    memcpy(C.pass, g_req.pass, (size_t)g_req.pass_len); C.pass_len = g_req.pass_len;\n'
+         '    if (C.rsn.akm != 8u) {\n'
+         '      int hex64 = (g_req.pass_len == 64);\n'
+         '      for (int i = 0; hex64 && i < 64; i++) { char ch = g_req.pass[i]; if (!((ch >= \'0\' && ch <= \'9\') || ((ch | 32) >= \'a\' && (ch | 32) <= \'f\'))) hex64 = 0; }\n'
+         '      if (hex64) { for (int i = 0; i < 32; i++) { const char *s = g_req.pass + 2 * i; int hi = (s[0] <= \'9\' ? s[0] - \'0\' : (s[0] | 32) - \'a\' + 10), lo = (s[1] <= \'9\' ? s[1] - \'0\' : (s[1] | 32) - \'a\' + 10); C.pmk[i] = (u8)((hi << 4) | lo); } }\n'
+         '      else nw_pbkdf2_sha1(g_req.pass, g_req.pass_len, C.ssid, C.ssid_len, 4096, C.pmk, 32); }\n'
+         '    lx_log(6, "wifi: security akm %u mfp %u (ap mfpc %u mfpr %u) h2e %u", C.rsn.akm, C.rsn.use_mfp, C.rsn.mfpc, C.rsn.mfpr, C.rsn.use_h2e);\n'
+         '  } else if (rsn) { lx_log(4, "wifi: network needs a passphrase"); connect_done(NW_RES_BAD_KEY); return; }\n'),
+    ])
+    # 18. Edit 17 keeps up to 768 bytes of a network's elements (IE_MAX), but the record handed out, struct nw_bss_info of
+    # include/nw_abi.h, still holds 384: a network with more overran the caller's stack by up to 384 bytes (11-17 half99m:
+    # pong_wifi_rejoin's nw_bss_info on the stack, a saved register overwritten, kernel data abort in fw_auto_thread; the
+    # scan results PongWifiNet hands to wifid take the same path). The module keeps all 768 for itself; callers get the
+    # first 384, as before edit 17.
+    edit(out / 'nw_sta_pong.c', [
+        ('    o->ie_len = b->ie_len; memcpy(o->ie, b->ie, b->ie_len); r = 0; }\n',
+         '    o->ie_len = b->ie_len < sizeof o->ie ? b->ie_len : (u16)sizeof o->ie; memcpy(o->ie, b->ie, o->ie_len); r = 0; }   /* edit 18 */\n'),
+    ])
+    return qrtr
+
+
+def patch_lx_rt(text):
+    """Make lx_rt.c safe across re-entrant lx_pump() waits inside timer callbacks."""
+    edits = [
+        ('int lx_queue_delayed(struct delayed_work *d, unsigned long ms) {\n'
+         '  if (!ms) { d->armed = 0; return lx_queue_work(&d->work); }\n'
+         '  int was = d->armed; if (!was) list_add_tail(&d->work.entry, &g_timers);\n'
+         '  d->armed = 1; d->due = lx_now_ms() + ms; return !was; }\n',
+         'int lx_queue_delayed(struct delayed_work *d, unsigned long ms) {\n'
+         '  if (!ms) { if (d->armed) { d->armed = 0; list_del_init(&d->work.entry); } return lx_queue_work(&d->work); }\n'
+         '  if (d->work.queued) lx_cancel_work(&d->work);\n'
+         '  int was = d->armed; if (!was) list_add_tail(&d->work.entry, &g_timers);\n'
+         '  d->armed = 1; d->due = lx_now_ms() + ms; return !was; }\n'),
+        ('  u64 now = lx_now_ms();\n'
+         '  struct list_head *p, *n;\n'
+         '  for (p = g_timers.next; p != &g_timers; p = n) {\n'
+         '    n = p->next; struct delayed_work *d = container_of(p, struct delayed_work, work.entry);\n'
+         '    if (d->armed && now >= d->due && !is_running(&d->work)) {\n'
+         '      d->armed = 0; list_del_init(p); ran = 1; where(2, (const void *)d->work.func);\n'
+         '      g_running[g_nrunning++] = &d->work; d->work.func(&d->work); g_nrunning--; }\n'
+         '  }\n',
+         '  /* one due timer at a time off the shared list: waits inside a callback call lx_pump() recursively,\n'
+         '   * which can fire or cancel a timer a prefetched next pointer would have stepped onto after list_del_init */\n'
+         '  u64 now = lx_now_ms();\n'
+         '  for (int budget = 256; budget > 0; budget--) {\n'
+         '    struct delayed_work *d = 0; struct list_head *e;\n'
+         '    for (e = g_timers.next; e != &g_timers; e = e->next) {\n'
+         '      struct delayed_work *c = container_of(e, struct delayed_work, work.entry);\n'
+         '      if (c->armed && now >= c->due && !is_running(&c->work)) { d = c; break; }\n'
+         '    }\n'
+         '    if (!d) break;\n'
+         '    d->armed = 0; list_del_init(&d->work.entry); ran = 1; where(2, (const void *)d->work.func);\n'
+         '    g_running[g_nrunning++] = &d->work; if (d->work.func) d->work.func(&d->work); g_nrunning--;\n'
+         '  }\n'),
+    ]
+    for old, new in edits:
+        if text.count(old) != 1:
+            raise RuntimeError('lx_rt.c differs at %r (%d)' % (old[:50], text.count(old)))
+        text = text.replace(old, new)
+    return text
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--linux', type=Path, default=input_path('wifi_linux'))
+    p.add_argument('--shared', type=Path, default=input_path('wifi_shared'))
+    p.add_argument('--output-dir', type=Path, required=True)
+    p.add_argument('--jobs', type=int, default=4)
+    p.add_argument('--t970', action='store_true', help='SM-T970 (QCA6390): the four edits of t970_edits()')
+    a = p.parse_args(); linux = a.linux.resolve(); shared = a.shared.resolve(); out = a.output_dir.resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    if not (linux / 'drivers/net/wireless/ath/ath11k/pci.c').is_file(): raise RuntimeError('Linux ath11k PCI sources required')
+    for file in ('include/nw_abi.h', 'shim/src/lx_rt.c', 'src/nw_sta.c'):
+        if not (shared / file).is_file(): raise RuntimeError('UniXNU Ath12kWifi shared ABI required: ' + file)
+    source = linux / 'drivers/net/wireless/ath/ath11k'
+    gen = out / 'ath11k'; gen.mkdir(exist_ok=True)
+    for f in source.glob('*'):
+        if f.suffix not in ('.c', '.h') or f.name == 'trace.h': continue
+        target = gen / f.name
+        if target.exists() or target.is_symlink(): target.unlink()
+        target.symlink_to(f)
+    traces = sorted({v for f in source.glob('*.[ch]') for v in re.findall(r'\btrace_ath11k_[a-z0-9_]+', f.read_text())})
+    (gen / 'trace.h').write_text('\n'.join('#define ' + n + '(...) ' + ('0' if n.endswith('_enabled') else '((void)0)') for n in traces) + '\n')
+    spectral = out / 'spectral_common.h'
+    if spectral.exists() or spectral.is_symlink(): spectral.unlink()
+    spectral.symlink_to(source.parent / 'spectral_common.h')
+    # A kernel variable-like jiffies macro cannot also name this statistics
+    # member. Rename only the generated member/access, not time expressions.
+    for name in ('core.h', 'dp_rx.c'):
+        content = (source / name).read_text().replace('unsigned long jiffies;', 'unsigned long bp_jiffies;').replace('bp_stats->jiffies', 'bp_stats->bp_jiffies')
+        (gen / name).unlink(); (gen / name).write_text(content)
+    pc = (source / 'pci.c').read_text()
+    for old, new in [('static int ath11k_pci_init(void)', 'int pong_ath11k_pci_init(void)'),
+                     ('static void ath11k_pci_exit(void)', 'void pong_ath11k_pci_exit(void)')]:
+        if pc.count(old) != 1: raise RuntimeError('Linux 7.0.14 PCI entry differs: ' + old)
+        pc = pc.replace(old, new)
+    (gen / 'pci.c').unlink(); (gen / 'pci.c').write_text(pc)
+    # Nothing CNSS2 selection, driven by actual QMI chip/board IDs. Linux's
+    # board-2 container is not part of this phone's firmware partition.
+    core = (gen / 'core.c').read_text()
+    needle = '\tbd->fw = ath11k_core_firmware_request(ab, name);'
+    replacement = r"""    char pong_bdf[48];
+    if (!strcmp(name, ATH11K_DEFAULT_BOARD_FILE)) {
+        u32 id = ab->qmi.target.board_id;
+        const char *prefix = (ab->qmi.target.chip_id & 0x10) ? "bdwlang" : "bdwlan";
+        if (id == 0xff) snprintf(pong_bdf, sizeof pong_bdf, "%s.elf", prefix);
+        else if (id < 0xff) snprintf(pong_bdf, sizeof pong_bdf, "%s.e%02x", prefix, id);
+        else snprintf(pong_bdf, sizeof pong_bdf, "bdwlan%02x.e%02x", (id >> 8) & 255, id & 255);
+        name = pong_bdf;
+        ath11k_info(ab, "Pong: actual QMI board firmware %s\n", name);
+    }
+""" + needle
+    if core.count(needle) != 1: raise RuntimeError('ath11k BDF request ABI differs')
+    (gen / 'core.c').unlink(); (gen / 'core.c').write_text(core.replace(needle, replacement))
+    # A radio crash is terminal for this dispatcher incarnation. Do not send
+    # new WMI packets or repeatedly schedule Linux recovery inside the work
+    # item that is still bringing the MAC up; the board retains DMA/reset.
+    mhi_source = (source / 'mhi.c').read_text()
+    needle = '\tswitch (cb) {\n\tcase MHI_CB_SYS_ERROR:'
+    replacement = '''    if (cb == MHI_CB_SYS_ERROR || cb == MHI_CB_EE_RDDM || cb == MHI_CB_FATAL_ERROR) {
+        extern void pong_ath11k_mhi_failed(struct mhi_controller *, int);
+        pong_ath11k_mhi_failed(mhi_cntrl, cb);
+        ab_pci->mhi_pre_cb = cb;
+        return;
+    }
+''' + needle
+    if mhi_source.count(needle) != 1: raise RuntimeError('ath11k MHI status ABI differs')
+    (gen / 'mhi.c').unlink(); (gen / 'mhi.c').write_text(mhi_source.replace(needle, replacement))
+    wmi = (source / 'wmi.c').read_text()
+    needle = '\tstruct ath11k_base *ab = wmi_ab->ab;\n\n\tmight_sleep();'
+    replacement = '''\tstruct ath11k_base *ab = wmi_ab->ab;
+    extern void pong_ath11k_wmi_submitted(u32);
+    if (test_bit(ATH11K_FLAG_CRASH_FLUSH, &ab->dev_flags)) return -ESHUTDOWN;
+    pong_ath11k_wmi_submitted(cmd_id);
+
+\tmight_sleep();'''
+    if wmi.count(needle) != 1: raise RuntimeError('ath11k WMI send ABI differs')
+    (gen / 'wmi.c').unlink(); (gen / 'wmi.c').write_text(wmi.replace(needle, replacement))
+    # Pong's mobile HSP firmware has no MBSSID AP context for a station.
+    # Linux's generic fallback labels even a station NON_MBSSID_AP; don't
+    # send AP-role flags on this STA-only board integration.
+    mac_source = (source / 'mac.c').read_text()
+    needle = '\tparams->mbssid_tx_vdev_id = 0;\n\n\tif (!test_bit('
+    replacement = '''\tparams->mbssid_tx_vdev_id = 0;
+    if (arvif->vif->type == NL80211_IFTYPE_STATION) goto pong_station_chains;
+
+\tif (!test_bit('''
+    if mac_source.count(needle) != 1: raise RuntimeError('ath11k vdev parameters differ')
+    mac_source = mac_source.replace(needle, replacement)
+    needle = '\tif (pdev->cap.supported_bands & WMI_HOST_WLAN_2G_CAP) {\n\t\tparams->chains'
+    if mac_source.count(needle) != 1: raise RuntimeError('ath11k STA chain setup differs')
+    mac_source = mac_source.replace(needle, 'pong_station_chains:\n' + needle)
+    # ath12k station uses split link/vif notifications; ath11k implements
+    # their combined legacy bss_info_changed callback. Forward real changes
+    # to that implementation, including assoc/disassoc, rather than NULL or
+    # a success stub. The non-MLO vif's default link is the selected BSS.
+    marker = 'static const struct ieee80211_ops ath11k_ops = {'
+    adapter = """static void pong_ath11k_vif_cfg_changed(struct ieee80211_hw *hw,
+        struct ieee80211_vif *vif, u64 changed)
+{
+    ath11k_mac_op_bss_info_changed(hw, vif, &vif->bss_conf, changed);
+}
+
+"""
+    if mac_source.count(marker) != 1: raise RuntimeError('ath11k operations table differs')
+    mac_source = mac_source.replace(marker, adapter + marker)
+    needle = '\t.bss_info_changed               = ath11k_mac_op_bss_info_changed,'
+    if mac_source.count(needle) != 1: raise RuntimeError('ath11k combined BSS callback differs')
+    mac_source = mac_source.replace(needle, needle +
+        '\n\t.link_info_changed              = ath11k_mac_op_bss_info_changed,' +
+        '\n\t.vif_cfg_changed                = pong_ath11k_vif_cfg_changed,')
+    (gen / 'mac.c').unlink(); (gen / 'mac.c').write_text(mac_source)
+    mac = (shared / 'src/nw_mac80211.c').read_text()
+    mac += r"""
+/* Linux ath11k still uses these mac80211 APIs; the shared station has one
+ * hardware and an explicit active-vif list. Honour the supplied vif address. */
+struct ieee80211_sta *ieee80211_find_sta_by_ifaddr(struct ieee80211_hw *hw, const u8 *addr, const u8 *local) {
+    if (hw != g_hw || !g_sta || !ether_addr_equal(g_sta->addr, addr)) return 0;
+    for (int i = 0; i < g_nvif; ++i) if (!local || ether_addr_equal(g_vif[i]->addr, local)) return g_sta;
+    return 0;
+}
+void ieee80211_queue_work(struct ieee80211_hw *hw, struct work_struct *work) { if (hw == g_hw) lx_queue_work(work); }
+"""
+    (out / 'nw_mac80211_pong.c').write_text(mac)
+
+    pinned = out / 'pinned'; pinned.mkdir(exist_ok=True)
+    inputs = {'linux/mhi.h': 'linux/mhi.h', 'linux/ieee80211.h': 'linux/ieee80211.h',
+        'linux/soc/qcom/qmi.h': 'linux/soc/qcom/qmi.h', 'net/cfg80211.h': 'net/cfg80211.h',
+        'net/regulatory.h': 'net/regulatory.h', 'net/codel.h': 'net/codel.h',
+        'net/ieee80211_radiotap.h': 'net/ieee80211_radiotap.h',
+        'linux/nl80211.h': 'uapi/linux/nl80211.h', 'linux/rfkill.h': 'uapi/linux/rfkill.h',
+        'uapi/linux/rfkill.h': 'uapi/linux/rfkill.h', 'net/mac80211.real.h': 'net/mac80211.h'}
+    inputs.update({str(f.relative_to(linux / 'include')): str(f.relative_to(linux / 'include'))
+                   for f in (linux / 'include/linux').glob('ieee80211-*.h')})
+    for target, name in inputs.items():
+        src = linux / 'include' / name
+        if not src.is_file(): raise RuntimeError('Missing Linux public header: ' + str(src))
+        dest = pinned / target; dest.parent.mkdir(parents=True, exist_ok=True)
+        if dest.exists() or dest.is_symlink(): dest.unlink()
+        dest.symlink_to(src)
+    mhi = out / 'mhi'; mhi.mkdir(exist_ok=True)
+    for name in ('init.c', 'main.c', 'pm.c', 'boot.c', 'internal.h'):
+        dest = mhi / name
+        if dest.exists() or dest.is_symlink(): dest.unlink()
+        dest.symlink_to(linux / 'drivers/bus/mhi/host' / name)
+    (mhi / 'trace.h').write_text((shared / 'shim/mhi/trace.h').read_text())
+    common = out / 'common.h'
+    if common.exists() or common.is_symlink(): common.unlink()
+    common.symlink_to(linux / 'drivers/bus/mhi/common.h')
+    env = build_env()
+    clang = subprocess.check_output(['xcrun', '-f', 'clang'], env=env, text=True).strip()
+    resource = subprocess.check_output([clang, '-print-resource-dir'], text=True).strip() + '/include'
+    overlay = ROOT / 'drivers/PongWifi/ath11k/compat'
+    flags = ['-target', 'arm64-apple-ios18.0', '-mkernel', '-O2', '-g0', '-ffreestanding',
+        '-fno-builtin', '-fno-common', '-fno-strict-aliasing', '-fwrapv', '-fno-stack-protector',
+        '-fno-delete-null-pointer-checks', '-mgeneral-regs-only', '-std=gnu11',
+        '-Wno-incompatible-pointer-types', '-Wno-error', '-Wno-unused-value',
+        '-nostdinc', '-isystem', str(shared / 'shim/libc'), '-isystem', resource,
+        '-I', str(overlay), '-include', 'PongCompat.h', '-I', str(shared / 'shim/include'),
+        '-I', str(shared / 'include'), '-I', str(pinned), '-I', str(shared / 'src'),
+        '-I', str(gen), '-I', str(out), '-I', str(source.parent), '-I', str(ROOT / 'drivers/T970Wifi'),
+        '-DCONFIG_ATH11K_PCI=1', '-DLX_BOOT_SETTLE_MS=0']
+    ath = 'core hal hal_tx hal_rx wmi mac reg htc qmi dp dp_tx dp_rx ce peer dbring hw pcic fw p2p mhi pci'.split()
+    jobs = [(gen / (n + '.c'), out / ('ath11k_' + n + '.o'), []) for n in ath]
+    jobs += [(mhi / (n + '.c'), out / ('mhi_' + n + '.o'), ['-I', str(mhi)]) for n in ('init', 'main', 'pm', 'boot')]
+    # WPA station nonces use Darwin's entropy source, not a timer/counter.
+    sta = (shared / 'src/nw_sta.c').read_text()
+    begin = sta.index('static void make_nonce(u8 *out) {')
+    end = sta.index('static void derive_ptk(void)', begin)
+    sta = sta[:begin] + 'extern void PongWifiRandom(void *, size_t);\nstatic void make_nonce(u8 *out) { PongWifiRandom(out, 32); }\n' + sta[end:]
+    (out / 'nw_sta_pong.c').write_text(sta)
+    # Preserve the user's no-checksum policy in the shared loader too.
+    runtime = (shared / 'shim/src/lx_rt.c').read_text()
+    begin = runtime.index('  static int settled;\n', runtime.index('int lx_request_firmware('))
+    end = runtime.index('  *fw = f;', begin)
+    runtime = patch_lx_rt(runtime[:begin] + runtime[end:])
+    (out / 'lx_rt_pong.c').write_text(runtime)
+    common_sources = ['src/nw_crypto.c', 'src/nw_mac80211.c', 'src/nw_net.c', 'src/nw_pci.c',
+        'src/nw_qrtr.c', 'src/nw_qrtr_mhi.c', 'src/nw_sta.c', 'shim/src/lx_rt.c', 'shim/src/mhi_hook.c']
+    replacements = {'src/nw_sta.c': out / 'nw_sta_pong.c',
+                    'src/nw_mac80211.c': out / 'nw_mac80211_pong.c',
+                    'shim/src/lx_rt.c': out / 'lx_rt_pong.c'}
+    if a.t970: replacements['src/nw_qrtr.c'] = t970_edits(gen, mhi, shared, out)
+    jobs += [(replacements.get(n, shared / n), out / ('shared_' + Path(n).stem + '.o'), []) for n in common_sources]
+    if a.t970: jobs += [(ROOT / 'drivers/T970Wifi/T970WifiWpa3.c', out / 'T970WifiWpa3.o', [])]
+    jobs += [(linux / ('drivers/soc/qcom/' + n + '.c'), out / (n + '.o'), []) for n in ('qmi_interface', 'qmi_encdec')]
+    jobs += [(ROOT / 'drivers/PongWifi/ath11k/PongAth11k.c', out / 'PongAth11k.o', [])]
+    commands = []
+    def compile(job):
+        src, obj, extra = job; cmd = [clang, *flags, *extra, '-c', str(src), '-o', str(obj)]
+        commands.append(cmd)
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        (out / (obj.stem + '.log')).write_text(r.stdout + r.stderr)
+        return obj.name if r.returncode else None
+    with ThreadPoolExecutor(a.jobs) as pool: failed = [r for r in pool.map(compile, jobs) if r]
+    (out / 'compile-commands.json').write_text(json.dumps(commands, indent=2) + '\n')
+    for name in failed:   # the logs stay on the runner; print their errors so CI shows them
+        log_text = (out / (Path(name).stem + '.log')).read_text()
+        print('== ' + name + '\n' + '\n'.join(l for l in log_text.splitlines() if 'error' in l)[:6000], flush=True)
+    if failed: raise SystemExit('ath11k compile failures (retained .log): ' + ', '.join(failed))
+    archive = out / 'libPongAth11k.a'
+    linked = out / 'ath11k-combined.o'
+    subprocess.run(['xcrun', 'ld', '-r', '-arch', 'arm64', *[str(o) for _, o, _ in jobs], '-o', str(linked)], env=env, check=True)
+    nm = pong_paths.tool('llvm-nm', 'PONG_LLVM_NM', ('/opt/local/bin/llvm-nm-mp-18',))
+    objcopy = pong_paths.tool('llvm-objcopy', 'PONG_LLVM_OBJCOPY', ('/opt/local/bin/llvm-objcopy-mp-18',))
+    undefined = subprocess.check_output([nm, '-u', '-j', str(linked)], text=True).splitlines()
+    (out / 'undefined-symbols.txt').write_text('\n'.join(undefined) + '\n')
+    allowed = {'_PE_parse_boot_argn','_PongWifiRandom','_pong_panel_power_last','_bzero','_memcmp','_memcpy','_memmove','_memset','_snprintf','_strchr','_strcmp','_strlen','_strncmp','_strncpy','_strtoul','_vsnprintf'}
+    if set(undefined) - allowed: raise RuntimeError('unimplemented ath11k imports: ' + repr(set(undefined) - allowed))
+    # Export only the documented board/station boundary. Linux shims have the
+    # same C names as XNU helpers, so namespace every other defined symbol.
+    exports = {'_PongWifiRandom', '_nw_wifi_where'}
+    defined = subprocess.check_output([nm, '--defined-only', '--extern-only', '-j', str(linked)], text=True).splitlines()
+    renames = {n: '_pong11_' + n[1:] for n in defined if not n.startswith('_nw_wifi_') and n not in exports}
+    mapping = out / 'symbol-map.txt'; mapping.write_text(''.join(k + ' ' + v + '\n' for k, v in renames.items()))
+    namespaced = out / 'PongAth11k-linked.o'
+    subprocess.run([objcopy, '--redefine-syms=' + str(mapping), str(linked), str(namespaced)], check=True)
+    archive.unlink(missing_ok=True)
+    subprocess.run(['xcrun', 'libtool', '-static', '-o', str(archive), str(namespaced)], env=env, check=True)
+    (out / 'build-report.json').write_text(json.dumps(dict(linux='v7.0.14', shared=str(shared),
+        guest='22H374', archive=str(archive), real_pci_mhi=True, wifi_operational=False,
+        missing_symbols_policy='no fabricated-success stubs', image_verification='skipped by request'), indent=2) + '\n')
+    print(archive)
+
+
+if __name__ == '__main__': main()
