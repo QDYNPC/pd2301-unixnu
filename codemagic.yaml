@@ -1,0 +1,42 @@
+workflows:
+  pd2301-kernel:
+    name: PD2301 kernel (macOS)
+    instance_type: mac_mini_m2
+    max_build_duration: 180
+    environment:
+      xcode: latest
+      vars:
+        LANG: en_US.UTF-8
+        UNIXNU_REF: c96b29975645b711dc06bc435c3ad27321ce817c
+    scripts:
+      - name: Fetch UniXNU at the pinned revision
+        script: |
+          set -e
+          rm -rf "$HOME/UniXNU"
+          git clone -q https://github.com/UniXNU/UniXNU.git "$HOME/UniXNU"
+          cd "$HOME/UniXNU"
+          git fetch -q --depth 1 origin "$UNIXNU_REF"
+          git checkout -q FETCH_HEAD
+          echo "UniXNU at $(git rev-parse --short HEAD)"
+
+      - name: Install device profile and component recipe
+        script: |
+          set -e
+          python3 "$CM_BUILD_DIR/scripts/install-unixnu-inputs.py" --unixnu "$HOME/UniXNU"
+
+      - name: Configure
+        script: |
+          set -e
+          cd "$HOME/UniXNU"
+          ./unixnu defconfig zizhan_ipados18_gpu_defconfig -D "$CM_BUILD_DIR"
+
+      - name: Build kernel
+        script: |
+          set -e
+          cd "$HOME/UniXNU"
+          ./unixnu build kernel -D "$CM_BUILD_DIR" -j6
+
+    artifacts:
+      - "$HOME/UniXNU/out/**/*.pong"
+      - "$HOME/UniXNU/out/**/mach.development.*"
+      - "$HOME/UniXNU/out/**/*.log"
