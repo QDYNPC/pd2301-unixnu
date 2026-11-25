@@ -37,8 +37,16 @@ def main():
         override=next((s for s in overrides if s.get('kind')=='refer' and s.get('name')==ref['name']),{})
         src=Path(override['local']).expanduser() if override.get('local') else DEVICE/'refer/ipados18'/ref['ref']
         if not src.is_absolute():src=DEVICE/src
-        rev=subprocess.check_output(['git','rev-parse','HEAD'],cwd=src,text=True).strip()
-        if rev!=ref['commit']:raise RuntimeError(f'Wrong source revision for {ref["name"]}')
+        if not (src/'.git').is_dir() and not (src/'.unixnu-commit').is_file():
+            import hashlib
+            key=hashlib.sha1(f"{ref['git']}\n{ref['commit']}".encode()).hexdigest()[:8]
+            alt=Path(os.environ.get('UNIXNU_FEEDS','/root/unixnu/out/feeds'))/(Path(ref['git']).stem+'-'+key)
+            if alt.is_dir():src=alt
+        if (src/'.unixnu-commit').is_file():
+            rev=(src/'.unixnu-commit').read_text().strip()
+        else:
+            rev=subprocess.check_output(['git','rev-parse','HEAD'],cwd=src,text=True).strip()
+        if rev!=ref['commit']:raise RuntimeError(f'Wrong source revision for {ref["name"]} ({rev[:12]} != {ref["commit"][:12]})')
         link(src,tree/'refer'/ref['name'])
     for name in ('drivers','kits','package'):link(DEVICE/name,tree/name)
     (tree/'scripts').mkdir(exist_ok=True)
