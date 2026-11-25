@@ -21,9 +21,18 @@ workflows:
 
       - name: Install build tools
         script: |
-          set -e
-          brew install ninja cmake || brew upgrade ninja cmake || true
-          for t in ninja cmake make git python3; do
+          set -uo pipefail
+          export HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_NO_ENV_HINTS=1
+          needed=()
+          for pair in "ninja:ninja" "cmake:cmake" "dtc:dtc" "lzfse:lzfse" "mtools:mcopy" "nasm:nasm" "acpica:iasl" "ccache:ccache"; do
+            pkg="${pair%%:*}"; bin="${pair##*:}"
+            command -v "$bin" >/dev/null 2>&1 || needed+=("$pkg")
+          done
+          if [ ${#needed[@]} -gt 0 ]; then
+            echo "brew install: ${needed[*]}"
+            brew install "${needed[@]}" || echo "some packages failed to install; continuing"
+          fi
+          for t in ninja cmake dtc lzfse mcopy nasm iasl ccache; do
             printf '%-8s ' "$t"; command -v "$t" || echo MISSING
           done
 
