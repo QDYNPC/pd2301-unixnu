@@ -194,6 +194,16 @@ if ! cmp -s "$ROOT/drivers/PongPower/ZizhanDisplayOwner.h" .cache/xnu-work/iokit
   cp "$ROOT/drivers/PongPower/ZizhanDisplayOwner.h" .cache/xnu-work/iokit/Kernel/ZizhanDisplayOwner.h
 fi
 export XNU_AVAILABILITY_PL=$ROOT/.cache/fakeroot/usr/local/libexec/availability.pl
+
+# Linux host tools (SETUP/*) must compile with the distribution clang, not the
+# Darwin cross compiler: the CLT shim adds glibc include paths.
+if [ -x /opt/unixnu-linux/CommandLineTools/usr/bin/xnu-host-cc ]; then
+  export HOST_CC=/opt/unixnu-linux/CommandLineTools/usr/bin/xnu-host-cc
+fi
+for mig in /opt/unixnu-linux/CommandLineTools/usr/libexec/migcom /opt/unixnu-linux/CommandLineTools/usr/bin/migcom; do
+  if [ -x "$mig" ]; then export MIGCOM="$mig"; break; fi
+done
+
 python3 scripts/prepare-xnu-source.py
 BOOT_PROGRESS=${XNU_BOOT_PROGRESS:-0}
 if [ "$BOOT_PROGRESS" != 0 ] && [ "$BOOT_PROGRESS" != 1 ]; then
