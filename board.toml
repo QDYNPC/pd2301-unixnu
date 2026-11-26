@@ -36,7 +36,7 @@ archives = []
 
 # Local prelink and userdata entries are documented under migration/ipados18.
 [firmware]
-config = "zizhan"
+config = "pd2301"
 dsc = "Platforms/vivo/pd2301Pkg/pd2301.dsc"
 fd = "Build/pd2301Pkg/{target}_CLANGPDB/FV/SILICIUM_UEFI.fd"
 patches = [
@@ -71,7 +71,7 @@ BUILDID_STRING = "UniXNU-Zizhan"
 PONG_INITRD_DISK_ENABLED = "1" # Set 0 to isolate SEC/HOB without the disk DXE.
 
 [payload]
-size_mib = 84
+size_mib = 56
 title = "Zizhan iPadOS 18.7.10"
 [payload.adt]
 packed_data_ramdisk = false
