@@ -8,7 +8,6 @@ workflows:
       vars:
         LANG: en_US.UTF-8
         UNIXNU_REF: c96b29975645b711dc06bc435c3ad27321ce817c
-        # GH_TOKEN comes from Codemagic environment variables
     scripts:
       - name: Fetch UniXNU at the pinned revision
         script: |
@@ -51,28 +50,30 @@ workflows:
       - name: Build kernel
         script: |
           set +e
+          export PONG_VOLUME_LAYOUT="$CM_BUILD_DIR/ci-inputs/volume-layout.json"
+          echo "volume layout: $PONG_VOLUME_LAYOUT"
           cd "$HOME/UniXNU"
           ./unixnu build kernel -D "$CM_BUILD_DIR" -j6
           rc=$?
           echo "kernel build rc=$rc"
 
-          # always publish the newest build log to the repo so it is readable from outside
           mkdir -p "$CM_BUILD_DIR/ci-logs"
           LOG=$(ls -t out/pd2301/*/*/build-*.log 2>/dev/null | head -1)
           if [ -n "$LOG" ]; then
             cp "$LOG" "$CM_BUILD_DIR/ci-logs/kernel.log"
-            echo "log: $LOG ($(wc -l < "$LOG") lines)"
           else
             echo "no build log produced" > "$CM_BUILD_DIR/ci-logs/kernel.log"
-            ./unixnu build kernel -D "$CM_BUILD_DIR" -j6 > "$CM_BUILD_DIR/ci-logs/kernel.log" 2>&1
           fi
-
           cd "$CM_BUILD_DIR"
           git config user.email ci@local
           git config user.name ci
           git add -f ci-logs/kernel.log
           git commit -qm "ci log rc=$rc" || true
-          git push -q --force "https://${GH_TOKEN}@github.com/QDYNPC/pd2301-unixnu.git" HEAD:refs/heads/ci-logs && echo "log pushed to ci-logs branch"
+          if [ -n "${GH_TOKEN:-}" ]; then
+            git push -q --force "https://${GH_TOKEN}@github.com/QDYNPC/pd2301-unixnu.git" HEAD:refs/heads/ci-logs && echo "log pushed"
+          else
+            echo "GH_TOKEN unset; log not pushed"
+          fi
           exit $rc
 
     artifacts:
