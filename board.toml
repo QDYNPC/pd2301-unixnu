@@ -91,4 +91,9 @@ cpus = 8
 # The matching Darwin24 prelinker derives relocation from the 22H374 ABI record.
 # The generic Darwin23 prelink/boot entry is intentionally not selected here.
 
-
+[kernel.prelink]
+tool = "kits/NativePrelink/emit_prelink.py"
+kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_PONG/mach.development.pong"
+slide = "-0x1000000"
+roots = ["com.apple.kec.corecrypto", "com.apple.kec.pthread", "com.apple.filesystems.apfs",
+         "com.apple.kec.Compression", "com.apple.AppleFSCompression.AppleFSCompressionTypeZlib"]
