@@ -32,14 +32,21 @@ workflows:
             echo "brew install: ${needed[*]}"
             brew install "${needed[@]}" || echo "some packages failed; continuing"
           fi
-          for t in ninja cmake dtc lzfse mcopy nasm iasl ccache; do
-            printf '%-8s ' "$t"; command -v "$t" || echo MISSING
-          done
 
       - name: Install device profile and component recipe
         script: |
           set -e
           python3 "$CM_BUILD_DIR/scripts/install-unixnu-inputs.py" --unixnu "$HOME/UniXNU"
+
+      - name: Fetch iPadOS firmware
+        script: |
+          set -e
+          cd "$HOME/UniXNU"
+          ./unixnu ipsw info -D "$CM_BUILD_DIR" || true
+          ./unixnu ipsw fetch -D "$CM_BUILD_DIR"
+          echo "== extracted members =="
+          find out/ipsw -maxdepth 3 -type f | head -30 || true
+          df -h /
 
       - name: Configure
         script: |
@@ -51,7 +58,6 @@ workflows:
         script: |
           set +e
           export PONG_VOLUME_LAYOUT="$CM_BUILD_DIR/ci-inputs/volume-layout.json"
-          echo "volume layout: $PONG_VOLUME_LAYOUT"
           cd "$HOME/UniXNU"
           ./unixnu build kernel -D "$CM_BUILD_DIR" -j6
           rc=$?
