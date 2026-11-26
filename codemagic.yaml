@@ -113,6 +113,7 @@ workflows:
       - name: Package payload and boot image
         script: |
           cd "$HOME/UniXNU"
+          mkdir -p "$CM_BUILD_DIR/artifacts"
           echo "== payload =="
           ./unixnu build payload -D "$CM_BUILD_DIR"
           prc=$?
@@ -128,6 +129,7 @@ workflows:
     artifacts:
       - "*.log"
       - "artifacts/**"
+
 
 
 
