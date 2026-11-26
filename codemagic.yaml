@@ -75,7 +75,9 @@ workflows:
           COMPLOG=$HOME/UniXNU/out/pd2301/ipados-18.7.10-22H374/zizhan_ipados18_gpu/logs/component-PongPlatform24.log
           if [ -f "$COMPLOG" ]; then
             echo "===== component log tail ====="
-            tail -40 "$COMPLOG"
+            tail -20 "$COMPLOG"
+            echo "===== compile errors ====="
+            grep -n "error:" "$COMPLOG" | head -40 || true
             echo "===== end ====="
           fi
 
@@ -100,5 +102,6 @@ workflows:
 
     artifacts:
       - "*.log"
+
 
 
