@@ -24,7 +24,7 @@ fetch = ["KernelCache", "DeviceTree", "StaticTrustCache", "Cryptex1,SystemOS", "
 include = ["PongPlatform24"]
 
 [device_tree]
-source = "device:dts/pd2301.dts"
+source = "device:dts/pd2301-ci.dts"
 include_dirs = ["soc:dts"]
 
 [kernel]
