@@ -110,9 +110,23 @@ workflows:
           fi
           exit $rc
 
+      - name: Package payload and boot image
+        script: |
+          set +e
+          cd "$HOME/UniXNU"
+          echo "== payload =="
+          ./unixnu build payload -D "$CM_BUILD_DIR"
+          echo "payload rc=$?"
+          echo "== boot image =="
+          ./unixnu bootimg -D "$CM_BUILD_DIR" -o "$CM_BUILD_DIR/artifacts/boot-pd2301.img"
+          echo "bootimg rc=$?"
+          mkdir -p "$CM_BUILD_DIR/artifacts"
+          find "$HOME/UniXNU/out/pd2301" -maxdepth 6 \( -name '*.img' -o -name '*.payload' \) -type f -exec cp {} "$CM_BUILD_DIR/artifacts/" \; 2>/dev/null || true
+          ls -l "$CM_BUILD_DIR/artifacts" || true
     artifacts:
       - "*.log"
       - "artifacts/**"
+
 
 
 
