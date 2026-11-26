@@ -118,17 +118,15 @@ workflows:
           ./unixnu build payload -D "$CM_BUILD_DIR"
           prc=$?
           echo "payload rc=$prc"
-          echo "== boot image =="
-          ./unixnu bootimg -D "$CM_BUILD_DIR" --fd "$CM_BUILD_DIR/ci-inputs/SILICIUM_UEFI.fd" -o "$CM_BUILD_DIR/artifacts/boot-pd2301.img"
-          brc=$?
-          echo "bootimg rc=$brc"
-          if [ "$prc" != 0 ] || [ "$brc" != 0 ]; then echo "packaging failed"; exit 1; fi
+          if [ "$prc" != 0 ]; then echo "payload failed"; exit 1; fi
+          cp "$HOME"/UniXNU/out/pd2301/*/*/payload/* "$CM_BUILD_DIR/artifacts/" 2>/dev/null || true
           mkdir -p "$CM_BUILD_DIR/artifacts"
           find "$HOME/UniXNU/out/pd2301" -maxdepth 6 \( -name '*.img' -o -name '*.payload' \) -type f -exec cp {} "$CM_BUILD_DIR/artifacts/" \; 2>/dev/null || true
           ls -l "$CM_BUILD_DIR/artifacts" || true
     artifacts:
       - "*.log"
       - "artifacts/**"
+
 
 
 
