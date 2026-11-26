@@ -44,7 +44,13 @@ workflows:
           cd "$HOME/UniXNU"
           ./unixnu fetch -D "$CM_BUILD_DIR"
           ./unixnu ipsw info -D "$CM_BUILD_DIR" || true
-          ./unixnu ipsw fetch -D "$CM_BUILD_DIR"
+          ok=0
+          for i in 1 2 3 4; do
+            if ./unixnu ipsw fetch -D "$CM_BUILD_DIR"; then ok=1; break; fi
+            echo "ipsw fetch attempt $i failed; retrying in 15s"
+            sleep 15
+          done
+          if [ "$ok" != 1 ]; then echo "ipsw fetch failed after 4 attempts"; exit 1; fi
           echo "== extracted members =="
           find out/ipsw -name 'kernelcache*' -type f 2>/dev/null | head -10 || true
           KC=$(find out/ipsw -name 'kernelcache*' -type f 2>/dev/null | head -1)
@@ -102,6 +108,7 @@ workflows:
 
     artifacts:
       - "*.log"
+
 
 
 
