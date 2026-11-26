@@ -92,7 +92,7 @@ cpus = 8
 # The generic Darwin23 prelink/boot entry is intentionally not selected here.
 
 [kernel.prelink]
-tool = "kits/NativePrelink/emit_prelink.py"
+tool = "/Users/builder/clone/kits/NativePrelink/emit_prelink.py"
 kernel = "build/xnu/ios-obj/DEVELOPMENT_ARM64_PONG/mach.development.pong"
 slide = "-0x1000000"
 roots = ["com.apple.kec.corecrypto", "com.apple.kec.pthread", "com.apple.filesystems.apfs",
