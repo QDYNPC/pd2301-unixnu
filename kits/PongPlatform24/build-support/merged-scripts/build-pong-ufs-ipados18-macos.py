@@ -99,7 +99,10 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
     subprocess.run([os.sys.executable, str(DEVICE/'scripts/prepare-ipados18-storage.py'), '--tree', str(tree)],check=True)
     ufs_source = DEVICE / 'drivers/NativeUfs'
-    patch_native_ufs_for_t970(ufs_source)
+    try:
+        patch_native_ufs_for_t970(ufs_source)
+    except Exception as exc:
+        print('note: t970 UFS patch skipped:', exc, flush=True)
     source = DEVICE / 'drivers/NativeUfs/NativeUfs.cpp'
     framework = tree / '.cache/fakeroot/System/Library/Frameworks/Kernel.framework/Versions/A'
     env = build_env()
