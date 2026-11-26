@@ -62,7 +62,7 @@ workflows:
         script: |
           set -e
           cd "$HOME/UniXNU"
-          ./unixnu defconfig zizhan_ipados18_gpu_defconfig -D "$CM_BUILD_DIR"
+          ./unixnu defconfig pong_ipados18_ci_defconfig -D "$CM_BUILD_DIR"
 
       - name: Build kernel
         script: |
@@ -100,4 +100,5 @@ workflows:
 
     artifacts:
       - "*.log"
+
 
