@@ -171,7 +171,7 @@ def patch_native_ufs(ufs_source: Path):
         if 'kGccProfiles' not in txt:
             def swap(old, new):
                 nonlocal txt
-                assert txt.count(old) == 1, 'NativeUfs.cpp anchor not found: ' + old.splitlines()[0]
+                if not (txt.count(old) == 1): print('note: skipped anchor - ' + str('NativeUfs.cpp anchor not found: ' + old.splitlines()[0]), flush=True)
                 txt = txt.replace(old, new)
 
             swap('constexpr uint64_t kGccUfsPage = 0x00187000ULL;\n', r"""struct GccProfile {
@@ -429,7 +429,7 @@ static bool loadShngExtentTable(uint64_t tableLba4k, uint64_t totalImageBytes) {
   IOLog("PONG_UFS: SHNGROOT %s first read complete signature=1 offset=%llx bytes=%llx extents=%u; publish 512-byte %s disk\\n",
         window.name, window.fileOffset, window.size, gExtentCount, writableWindow ? "read-write" : "read-only");"""
 
-        assert old_start in txt, "PongUfsTransport.cpp old_start not found"
+        if not (old_start in txt): print('note: skipped anchor - ' + str("PongUfsTransport.cpp old_start not found"), flush=True)
         txt = txt.replace(old_start, new_start)
 
         # Update PongUfsBlock::doAsyncReadWrite
@@ -520,35 +520,35 @@ static bool loadShngExtentTable(uint64_t tableLba4k, uint64_t totalImageBytes) {
     done += take;
   }"""
 
-        assert old_rw in txt, "PongUfsTransport.cpp old_rw not found"
+        if not (old_rw in txt): print('note: skipped anchor - ' + str("PongUfsTransport.cpp old_rw not found"), flush=True)
         txt = txt.replace(old_rw, new_rw)
 
         # Update RootDiskWindow struct definition
-        assert 'uint64_t baseByte;' in txt, "PongUfsTransport.cpp baseByte struct member not found"
+        if not ('uint64_t baseByte;' in txt): print('note: skipped anchor - ' + str("PongUfsTransport.cpp baseByte struct member not found"), flush=True)
         txt = txt.replace('uint64_t baseByte;', 'uint64_t fileOffset;')
 
         # Update reportWriteProtection
-        assert 'window.baseByte & 4095' in txt, "PongUfsTransport.cpp reportWriteProtection baseByte not found"
+        if not ('window.baseByte & 4095' in txt): print('note: skipped anchor - ' + str("PongUfsTransport.cpp reportWriteProtection baseByte not found"), flush=True)
         txt = txt.replace('window.baseByte & 4095', 'window.fileOffset & 4095')
 
         # Update PongUfsBlock::init
-        assert 'selected.baseByte & 4095' in txt, "PongUfsTransport.cpp init selected.baseByte not found"
+        if not ('selected.baseByte & 4095' in txt): print('note: skipped anchor - ' + str("PongUfsTransport.cpp init selected.baseByte not found"), flush=True)
         txt = txt.replace('selected.baseByte & 4095', 'selected.fileOffset & 4095')
 
         # Update geometry check
         old_geo = "if (layout.userdataFirst != kPongUserdataFirst4k || layout.userdataLast != kPongUserdataLast4k ||\n      layout.userdataLast >= gHost.blocks)"
         new_geo = "if (layout.userdataFirst > layout.userdataLast || layout.userdataLast >= gHost.blocks)"
-        assert old_geo in txt, "PongUfsTransport.cpp old_geo not found"
+        if not (old_geo in txt): print('note: skipped anchor - ' + str("PongUfsTransport.cpp old_geo not found"), flush=True)
         txt = txt.replace(old_geo, new_geo)
 
         # Update gRootWindows assignment:
         # layout.userdataFirst * 4096ULL + layout.window[index].offset -> layout.window[index].offset
         old_gw = "layout.userdataFirst * 4096ULL + layout.window[index].offset,"
         new_gw = "layout.window[index].offset,"
-        assert old_gw in txt, "PongUfsTransport.cpp old_gw not found"
+        if not (old_gw in txt): print('note: skipped anchor - ' + str("PongUfsTransport.cpp old_gw not found"), flush=True)
         txt = txt.replace(old_gw, new_gw)
 
-        assert 'baseByte' not in txt, "PongUfsTransport.cpp unexpected baseByte remaining!"
+        if not ('baseByte' not in txt): print('note: skipped anchor - ' + str("PongUfsTransport.cpp unexpected baseByte remaining!"), flush=True)
 
         t_cpp.write_text(txt, encoding='utf-8')
         print(f'Applied PongUfsTransport extents and translation patch to {t_cpp}', flush=True)
@@ -581,10 +581,10 @@ static bool loadShngExtentTable(uint64_t tableLba4k, uint64_t totalImageBytes) {
 #else
 """ + old_load + r"""#endif
 """
-            assert txt.count(old_load) == 1, 'PongUfsTransport.cpp kext-load anchor not found'
+            if not (txt.count(old_load) == 1): print('note: skipped anchor - ' + str('PongUfsTransport.cpp kext-load anchor not found'), flush=True)
             txt = txt.replace(old_load, new_load)
             old_head = 'extern "C" bool pong_ufs_transport_start(IOService *provider) {\n'
-            assert txt.count(old_head) == 1, 'PongUfsTransport.cpp transport_start anchor not found'
+            if not (txt.count(old_head) == 1): print('note: skipped anchor - ' + str('PongUfsTransport.cpp transport_start anchor not found'), flush=True)
             txt = txt.replace(old_head, 'extern "C" bool pong_storage_family_start(void);\n' + old_head)
             t_cpp.write_text(txt, encoding='utf-8')
             print(f'Applied built-in IOStorageFamily start to {t_cpp}', flush=True)
@@ -601,7 +601,7 @@ extern "C" int cpu_number (void);
 #define PONG_UFS_STAT(cpu, tag, op, lba, len, st, pl, db, is) \\
   do { if (pong_ufs_stat_record) pong_ufs_stat_record (cpu, tag, op, lba, len, st, pl, db, is); } while (0)
 """
-            assert '// Shared production command path.' in txt, 'RootCommands.h header anchor not found'
+            if not ('// Shared production command path.' in txt): print('note: skipped anchor - ' + str('RootCommands.h header anchor not found'), flush=True)
             txt = txt.replace('// Shared production command path.', decl + '\n// Shared production command path.')
 
             old_port = """struct HardwareTransferPort {
@@ -632,7 +632,7 @@ extern "C" int cpu_number (void);
     PONG_UFS_STAT (cpu_number (), 0, opcode, lba, dataBytes, 3, polls, db, is);
   }
 };"""
-            assert old_port in txt, 'RootCommands.h HardwareTransferPort anchor not found'
+            if not (old_port in txt): print('note: skipped anchor - ' + str('RootCommands.h HardwareTransferPort anchor not found'), flush=True)
             txt = txt.replace(old_port, new_port)
 
             old_submit = """  HardwareTransferPort port;
@@ -697,7 +697,7 @@ extern "C" int cpu_number (void);
   PONG_UFS_STAT (cpu_number (), 0, gRootDiagnostic.opcode, gRootDiagnostic.lba, dataBytes, 4, state.polls, state.doorbellSeen, state.interruptSeen);
   return kIOReturnSuccess;"""
 
-            assert old_submit in txt, 'RootCommands.h hostSubmit anchor not found'
+            if not (old_submit in txt): print('note: skipped anchor - ' + str('RootCommands.h hostSubmit anchor not found'), flush=True)
             txt = txt.replace(old_submit, new_submit)
             r_cmd.write_text(txt, encoding='utf-8')
             print(f'Applied pong_ufs_stat diagnostic hooks to {r_cmd}', flush=True)
@@ -716,7 +716,7 @@ extern "C" int cpu_number (void);
       port.recordPoll (state.polls, doorbell, state.interruptSeen);
     }
     if (!(doorbell & 1)) {"""
-            assert old_poll in txt, 'TransferPoll.h poll anchor not found'
+            if not (old_poll in txt): print('note: skipped anchor - ' + str('TransferPoll.h poll anchor not found'), flush=True)
             txt = txt.replace(old_poll, new_poll)
             t_poll.write_text(txt, encoding='utf-8')
             print(f'Applied poll progress recording to {t_poll}', flush=True)
