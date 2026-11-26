@@ -42,6 +42,7 @@ workflows:
         script: |
           set -e
           cd "$HOME/UniXNU"
+          ./unixnu fetch -D "$CM_BUILD_DIR"
           ./unixnu ipsw info -D "$CM_BUILD_DIR" || true
           ./unixnu ipsw fetch -D "$CM_BUILD_DIR"
           echo "== extracted members =="
