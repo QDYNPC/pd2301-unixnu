@@ -1,0 +1,6 @@
+{
+  "os": {"uuid": "A1B2C3D4-0000-4000-8000-000000000001"},
+  "data": {"uuid": "A1B2C3D4-0000-4000-8000-000000000002"},
+  "systemos": {"uuid": "A1B2C3D4-0000-4000-8000-000000000003"},
+  "_note": "Placeholder volume layout so the kernel compiles. Replace with the UUIDs observed on the target iPadOS volumes before booting."
+}
