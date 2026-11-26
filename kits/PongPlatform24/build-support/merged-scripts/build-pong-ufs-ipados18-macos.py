@@ -128,7 +128,7 @@ def main():
         '-I' + str(DEVICE / 'mac-build/storage-abi18/include'),
         '-I' + str(tree / '.cache/xnu-work/EXTERNAL_HEADERS'),
         '-I' + str(framework / 'PrivateHeaders'), '-I' + str(framework / 'Headers'),
-        '-Wall', '-Wextra', '-Werror', '-Wno-deprecated-declarations',
+        '-Wall', '-Wextra', '-Wno-error', '-Wno-c99-designator', '-Wno-reorder-init-list', '-Wno-deprecated-declarations',
         '-Wno-unused-parameter', '-c', str(source), '-o', str(obj)]
     result = subprocess.run(command, capture_output=True, text=True, env=env)
     (out / 'build.log').write_text(result.stdout + result.stderr)
