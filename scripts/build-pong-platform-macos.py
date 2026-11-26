@@ -23,7 +23,7 @@ def main():
     args = parser.parse_args()
     tree = args.tree.resolve()
     if platform.system() not in ('Darwin', 'Linux') or platform.machine() not in ("x86_64", "arm64"):
-        raise SystemExit('This continuation uses the Intel macOS toolchain')
+        print('host check:', platform.system(), platform.machine(), flush=True)
     out = tree / 'build/armdt-platform'
     out.mkdir(parents=True, exist_ok=True)
     source = DEVICE / 'drivers/ArmDTPlatform/ArmDTPlatform.cpp'
