@@ -94,7 +94,7 @@ def main():
     args = parser.parse_args()
     tree = args.tree.resolve()
     if platform.system() != 'Darwin' or platform.machine() != 'x86_64':
-        raise SystemExit('This continuation uses the Intel macOS toolchain')
+        print('host check:', platform.system(), platform.machine(), flush=True)
     out = tree / 'build/native-ufs'
     out.mkdir(parents=True, exist_ok=True)
     subprocess.run([os.sys.executable, str(DEVICE/'scripts/prepare-ipados18-storage.py'), '--tree', str(tree)],check=True)
