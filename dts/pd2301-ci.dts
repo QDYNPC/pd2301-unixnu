@@ -466,6 +466,11 @@
 		};
 	};
 
+	psci {
+		compatible = "arm,psci-1.0";
+		method = "smc";
+	};
+
 	cpus {
 		#address-cells = <0x02>;
 		#size-cells = <0x00>;
@@ -642,50 +647,7 @@
 			};
 		};
 
-		cpu-map {
-
-			cluster0 {
-
-				core0 {
-					cpu = <0x15>;
-				};
-
-				core1 {
-					cpu = <0x16>;
-				};
-
-				core2 {
-					cpu = <0x17>;
-				};
-
-				core3 {
-					cpu = <0x18>;
-				};
 			};
-
-			cluster1 {
-
-				core0 {
-					cpu = <0x19>;
-				};
-
-				core1 {
-					cpu = <0x1a>;
-				};
-
-				core2 {
-					cpu = <0x1b>;
-				};
-			};
-
-			cluster2 {
-
-				core0 {
-					cpu = <0x1c>;
-				};
-			};
-		};
-	};
 
 	idle-states {
 
