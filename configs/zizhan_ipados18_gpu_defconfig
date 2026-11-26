@@ -63,4 +63,4 @@ CONFIG_XNU_ZONE_PGZ_ALIGNMENT_PROBE=n
 
 # CONFIG_XNU_PONG_WIFI is not set
 # ADSP + battery manager (drivers/PongPower); still off at run time unless pong_adsp=1/2.
-CONFIG_XNU_PONG_POWER=y
+CONFIG_XNU_PONG_POWER=n
