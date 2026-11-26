@@ -46,7 +46,16 @@ workflows:
           ./unixnu ipsw info -D "$CM_BUILD_DIR" || true
           ./unixnu ipsw fetch -D "$CM_BUILD_DIR"
           echo "== extracted members =="
-          find out/ipsw -maxdepth 3 -type f | head -30 || true
+          find out/ipsw -name 'kernelcache*' -type f 2>/dev/null | head -10 || true
+          KC=$(find out/ipsw -name 'kernelcache*' -type f 2>/dev/null | head -1)
+          if [ -n "$KC" ]; then
+            DEST="$CM_BUILD_DIR/apple/ipados18-22H374/components/kernelcache.release.ipad7c.decompressed"
+            mkdir -p "$DEST"
+            cp "$KC" "$DEST/kernelcache.release.ipad7c.decompressed"
+            echo "kernelcache -> $DEST ($(wc -c < "$KC") bytes)"
+          else
+            echo "no kernelcache found in out/ipsw"
+          fi
           df -h /
 
       - name: Configure
@@ -63,6 +72,12 @@ workflows:
           ./unixnu build kernel -D "$CM_BUILD_DIR" -j6
           rc=$?
           echo "kernel build rc=$rc"
+          COMPLOG=$HOME/UniXNU/out/pd2301/ipados-18.7.10-22H374/zizhan_ipados18_gpu/logs/component-PongPlatform24.log
+          if [ -f "$COMPLOG" ]; then
+            echo "===== component log tail ====="
+            tail -40 "$COMPLOG"
+            echo "===== end ====="
+          fi
 
           mkdir -p "$CM_BUILD_DIR/ci-logs"
           LOG=$(ls -t out/pd2301/*/*/build-*.log 2>/dev/null | head -1)
@@ -85,3 +100,4 @@ workflows:
 
     artifacts:
       - "*.log"
+
