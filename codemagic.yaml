@@ -115,7 +115,7 @@ workflows:
           cd "$HOME/UniXNU"
           mkdir -p "$CM_BUILD_DIR/artifacts"
           echo "== payload =="
-          ./unixnu build payload -D "$CM_BUILD_DIR"
+          ./unixnu build payload -D "$CM_BUILD_DIR" --data-ramdisk "$CM_BUILD_DIR/ci-inputs/data-ramdisk.bin"
           prc=$?
           echo "payload rc=$prc"
           if [ "$prc" != 0 ]; then echo "payload failed"; exit 1; fi
@@ -126,6 +126,7 @@ workflows:
     artifacts:
       - "*.log"
       - "artifacts/**"
+
 
 
 
