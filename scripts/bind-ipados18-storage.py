@@ -4,7 +4,7 @@ import argparse,json,struct,subprocess,sys
 from pathlib import Path
 ROOT=Path(__file__).resolve().parents[1];sys.path.insert(0,str(ROOT/'kits/NativePrelink'))
 import native_prelink as np
-p=argparse.ArgumentParser(description=__doc__);p.add_argument('--object',type=Path,required=True);p.add_argument('--output',type=Path,required=True);a=p.parse_args()
+p=argparse.ArgumentParser(description=__doc__);p.add_argument('--object',type=Path,required=True);p.add_argument('--output',type=Path,required=True);p.add_argument('--mode',default='self');a=p.parse_args()
 r=json.loads((ROOT/'mac-build/storage-abi18/bindings-layout.json').read_text())
 if r['build']!='22H374':raise SystemExit('Wrong target storage bindings')
 b=a.object.read_bytes();m=np.macho(b);at=next(o for c,o,l in m['commands'] if c==2);sy,n,st,sz=struct.unpack_from('<4I',b,at+8)
